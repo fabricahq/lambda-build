@@ -9,7 +9,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from zipfile import ZIP_STORED, ZipFile
+from zipfile import ZIP_STORED, ZipFile, ZipInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "lambda_build.py"
@@ -250,6 +250,100 @@ class ExportTests(unittest.TestCase):
             outside.mkdir()
             with self.assertRaisesRegex(lambda_build.ReleaseError, "links outside the tree"):
                 lambda_build.export(repo, lambda_build.resolve_commit(repo, "HEAD"), outside)
+
+
+class CheckTests(unittest.TestCase):
+    """`check` accepts a release directory only if it is exactly what `package` writes for its ZIPs and commit."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.settings = {"image": BUSYBOX, "build": "true", "runtime": "provided.al2023", "architecture": "arm64",
+                         "executable": ["bootstrap"],
+                         "assets": [{"name": "api", "directory": "build/api", "files": ["bootstrap"]},
+                                    {"name": "worker", "directory": "build/worker"}]}
+        (self.repo / "lambda-build.toml").write_text(toml(self.settings))
+        git = ["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.com"]
+        subprocess.run([*git, "init", "-q"], check=True)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "config"], check=True)
+        self.commit = lambda_build.resolve_commit(self.repo, "HEAD")
+        tree = self.root / "tree"
+        for name in ("api", "worker"):
+            (tree / "build" / name).mkdir(parents=True)
+            (tree / "build" / name / "bootstrap").write_bytes(f"#!/bin/sh\necho {name}\n".encode())
+        self.release = self.root / "release"
+        lambda_build.package(tree, lambda_build.parse_config(toml(self.settings)), self.commit, self.release)
+        self.manifest_text = (self.release / "manifest.json").read_text()
+
+    def check(self, commit=None):
+        return subprocess.run([sys.executable, str(SCRIPT), "check", "--release-dir", str(self.release),
+                               "--commit", commit or self.commit, "--repo", str(self.repo)],
+                              text=True, capture_output=True)
+
+    def assert_blocked(self, message):
+        result = self.check()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(message, result.stderr)
+
+    def manifest(self, change):
+        manifest = json.loads(self.manifest_text)
+        change(manifest)
+        (self.release / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    def test_accepts_exactly_what_package_writes(self):
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, (self.release / "SHA256SUMS").read_text())
+
+    def test_blocks_a_manifest_for_another_commit(self):
+        result = self.check(commit="b" * 40)
+        self.assertEqual(result.returncode, 1)
+
+    def test_blocks_an_extra_json_document(self):
+        (self.release / "manifest.json").write_text("{}\n" + self.manifest_text)
+        self.assert_blocked("manifest.json does not match")
+
+    def test_blocks_whitespace_in_a_digest(self):
+        self.manifest(lambda m: m["assets"][0].update(sha256=m["assets"][0]["sha256"] + "\n"))
+        self.assert_blocked("manifest.json does not match")
+
+    def test_blocks_stray_bytes_in_sha256sums(self):
+        sums = (self.release / "SHA256SUMS").read_bytes()
+        for stray in (b"\0", b"\n", b"\n\n"):
+            with self.subTest(stray=stray):
+                (self.release / "SHA256SUMS").write_bytes(sums + stray)
+                self.assert_blocked("SHA256SUMS does not match")
+
+    def test_blocks_wrong_or_missing_names_and_sizes(self):
+        changes = {"wrong name": lambda m: m["assets"][0].update(name="other"),
+                   "missing name": lambda m: m["assets"][0].pop("name"),
+                   "wrong size": lambda m: m["assets"][0].update(size=m["assets"][0]["size"] + 1),
+                   "missing size": lambda m: m["assets"][0].pop("size"),
+                   "format 2": lambda m: m.update(format_version=2)}
+        for label, change in changes.items():
+            with self.subTest(label):
+                self.manifest(change)
+                self.assert_blocked("manifest.json does not match")
+
+    def test_blocks_extra_and_missing_files(self):
+        (self.release / "notes.txt").write_text("extra")
+        self.assert_blocked("notes.txt")
+        (self.release / "notes.txt").unlink()
+        (self.release / "worker.zip").unlink()
+        self.assert_blocked("worker.zip")
+
+    def test_blocks_changed_or_noncanonical_zips(self):
+        original = (self.release / "api.zip").read_bytes()
+        (self.release / "api.zip").write_bytes(original + b"x")
+        self.assert_blocked("api.zip")
+        # Matching metadata cannot make a ZIP canonical: here the bootstrap lost its executable bit.
+        with ZipFile(self.release / "api.zip", "w") as bundle:
+            bundle.writestr(ZipInfo("bootstrap", (1980, 1, 1, 0, 0, 0)), b"#!/bin/sh\necho api\n")
+        self.assert_blocked("api.zip is not the canonical ZIP")
 
 
 class CaseCollisionTests(unittest.TestCase):

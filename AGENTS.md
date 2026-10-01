@@ -4,7 +4,7 @@ The [README](README.md) explains what this repository does and how application r
 
 The repository has two parts that share one artifact contract:
 
-- `lambda_build.py` builds a commit in its pinned container and packages the release files, or rebuilds a published release to verify it.
+- `lambda_build.py` builds a commit in its pinned container and packages the release files, checks a release directory without building, or rebuilds a published release to verify it. `package` and `check` share the asset rules and the code that writes ZIPs, `SHA256SUMS`, and `manifest.json`; keep it shared so the two cannot drift.
 - `.github/workflows/build.yml` runs it in a read-only job and uploads the `release-assets` artifact for Release Planner's release-assets hook. It checks out `lambda_build.py` from `job.workflow_sha`, so callers pin one commit for everything.
 
 lambda-build never tags or publishes; Release Planner does. Deployments pin release digests, so treat the ZIP bytes, `SHA256SUMS`, and `manifest.json` as a public format. A change that alters the bytes for the same input needs a new manifest `format_version` and a deliberate decision, never a side effect. The fixture digest test and `examples/go-function/expected-SHA256SUMS` exist to catch such changes.

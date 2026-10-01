@@ -4,22 +4,25 @@
 twice inside the container image pinned there, and packages each build into ZIPs, SHA256SUMS,
 and manifest.json. It fails unless both packagings are byte-identical. `verify` rebuilds a
 published release from its manifest's source commit the same way and compares the files.
+`check` confirms, without building, that a release directory is exactly what `package` writes
+for its ZIPs and commit, so a publish job can trust it.
 
 Each ZIP stores its entries uncompressed, sorted by path, with a fixed timestamp and fixed
-permissions, so the same files always produce the same bytes. Requires Python 3.11+, Git,
-and Docker.
+permissions, so the same files always produce the same bytes. Requires Python 3.11+ and Git;
+`package` and `verify` also need Docker.
 """
 import argparse
 import hashlib
 import json
 import os
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
 import tempfile
 import tomllib
-from zipfile import ZIP_STORED, ZipFile, ZipInfo
+from zipfile import ZIP_STORED, BadZipFile, ZipFile, ZipInfo
 
 # Format 3 records runtime and architecture on each asset; format 2 recorded them once per release.
 FORMAT_VERSION = 3
@@ -125,6 +128,12 @@ def collect(directory):
     return sorted(files)
 
 
+def check_names(names):
+    """Fail when asset names differ only in case: a case-insensitive filesystem stores both ZIPs as one file."""
+    if len({name.casefold() for name in names}) != len(set(names)):
+        raise ReleaseError(f"Asset names {sorted(names)} must not differ only in case")
+
+
 def resolve_assets(root, config):
     """Map each asset name to (directory, expected files or None), reading assets_from as the build left it."""
     specs = [(a["name"], contained(root, relative_path(root, a["directory"], "asset directory")), a.get("files"))
@@ -140,9 +149,7 @@ def resolve_assets(root, config):
     resolved = {name: (directory, expected) for name, directory, expected in specs}
     if len(resolved) != len(specs):
         raise ReleaseError("Each asset name may appear only once")
-    # A case-insensitive filesystem would store both ZIPs as one file.
-    if len({name.casefold() for name in resolved}) != len(resolved):
-        raise ReleaseError(f"Asset names {sorted(resolved)} must not differ only in case")
+    check_names(resolved)
     if not resolved:
         raise ReleaseError(f"{config['assets_from']}: no function directories to package")
     return resolved
@@ -161,6 +168,55 @@ def write_zip(entries, archive):
             bundle.writestr(entry, data)
 
 
+def check_asset(name, files, unpacked_size, expected, config):
+    """Apply the per-asset rules shared by `package` and `check` to one asset's sorted file list."""
+    if not NAME.fullmatch(name):
+        raise ReleaseError(f"Asset name {name!r} must start with a letter or digit and use only letters, digits, '.', '_', and '-'")
+    if expected is not None and set(files) != set(expected):
+        missing, unexpected = sorted(set(expected) - set(files)), sorted(set(files) - set(expected))
+        raise ReleaseError(f"{name}: must contain exactly the expected files; "
+                           f"missing {missing or 'none'}, unexpected {unexpected or 'none'}")
+    if unpacked_size > MAX_UNPACKED_BYTES:
+        raise ReleaseError(f"{name}: files exceed Lambda's 250 MiB unzipped limit")
+    if config["runtime"].startswith("provided") and ("bootstrap" not in files or "bootstrap" not in config["executable"]):
+        raise ReleaseError(f"{name}: an OS-only runtime needs an executable bootstrap at the ZIP root; "
+                           "add bootstrap to executable")
+
+
+def check_executables(config, file_lists):
+    """Fail when an `executable` path matches no file in any asset, which usually means a typo."""
+    for path in sorted(set(config["executable"])):
+        if not any(path in files for files in file_lists):
+            raise ReleaseError(f"executable {path} matches no packaged file")
+
+
+def zip_bytes(entries):
+    """Return the canonical ZIP bytes for (path, bytes, executable) entries, in the given order."""
+    buffer = BytesIO()
+    write_zip(entries, buffer)
+    return buffer.getvalue()
+
+
+def release_metadata(commit, config, archives):
+    """Return the SHA256SUMS text and manifest for (name, ZIP bytes) pairs sorted by name.
+
+    `package` writes exactly these files and `check` requires them, byte for byte.
+    """
+    if not COMMIT.fullmatch(commit):
+        raise ReleaseError("Source commit must be a full, lowercase Git commit SHA")
+    entries = []
+    for name, data in archives:
+        if len(data) > MAX_ZIP_BYTES:
+            raise ReleaseError(f"{name}: {name}.zip exceeds Lambda's 50 MiB direct-upload limit")
+        entries.append({"name": name, "asset": f"{name}.zip", "sha256": hashlib.sha256(data).hexdigest(),
+                        "size": len(data), "runtime": config["runtime"], "architecture": config["architecture"]})
+    sums = "".join(f"{e['sha256']}  {e['asset']}\n" for e in entries)
+    # Runtime and architecture describe each asset, so the format can hold assets built for
+    # different runtimes without changing.
+    manifest = {"format_version": FORMAT_VERSION, "source_commit": commit, "assets": entries}
+    return sums, manifest, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+
+
 def package(root, config, commit, output):
     """Package the built tree at `root` into ZIPs, SHA256SUMS, and manifest.json in a new or empty `output`.
 
@@ -170,51 +226,85 @@ def package(root, config, commit, output):
         raise ReleaseError("Source commit must be a full, lowercase Git commit SHA")
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ReleaseError(f"{output}: output must be a new or empty directory, so no stale asset is published")
-    runtime, executables = config["runtime"], set(config["executable"])
-
+    executables = set(config["executable"])
     contents = {}
     for name, (directory, expected) in sorted(resolve_assets(root, config).items()):
-        if not NAME.fullmatch(name):
-            raise ReleaseError(f"Asset name {name!r} must start with a letter or digit and use only letters, digits, '.', '_', and '-'")
         files = collect(directory)
-        if expected is not None and set(files) != set(expected):
-            missing, unexpected = sorted(set(expected) - set(files)), sorted(set(files) - set(expected))
-            raise ReleaseError(f"{name}: {directory.relative_to(root)} must contain exactly the expected files; "
-                               f"missing {missing or 'none'}, unexpected {unexpected or 'none'}")
-        if sum((directory / f).stat().st_size for f in files) > MAX_UNPACKED_BYTES:
-            raise ReleaseError(f"{name}: files exceed Lambda's 250 MiB unzipped limit")
-        if runtime.startswith("provided") and ("bootstrap" not in files or "bootstrap" not in executables):
-            raise ReleaseError(f"{name}: an OS-only runtime needs an executable bootstrap at the ZIP root; "
-                               "add bootstrap to executable")
+        check_asset(name, files, sum((directory / f).stat().st_size for f in files), expected, config)
         contents[name] = (directory, files)
-    for path in sorted(executables):
-        if not any(path in files for _, files in contents.values()):
-            raise ReleaseError(f"executable {path} matches no packaged file")
+    check_executables(config, [files for _, files in contents.values()])
+    archives = [(name, zip_bytes([(f, (directory / f).read_bytes(), f in executables) for f in files]))
+                for name, (directory, files) in contents.items()]
+    sums, manifest, manifest_text = release_metadata(commit, config, archives)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     # Stage beside the output and move it into place last, so a failure never leaves partial assets.
     with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as temporary:
         staging = Path(temporary) / "release"
         staging.mkdir()
-        entries = []
-        for name, (directory, files) in contents.items():
-            archive = staging / f"{name}.zip"
-            write_zip([(f, (directory / f).read_bytes(), f in executables) for f in files], archive)
-            size = archive.stat().st_size
-            if size > MAX_ZIP_BYTES:
-                raise ReleaseError(f"{name}: {archive.name} exceeds Lambda's 50 MiB direct-upload limit")
-            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-            entries.append({"name": name, "asset": archive.name, "sha256": digest, "size": size,
-                            "runtime": runtime, "architecture": config["architecture"]})
-        (staging / "SHA256SUMS").write_text("".join(f"{e['sha256']}  {e['asset']}\n" for e in entries))
-        # Runtime and architecture describe each asset, so the format can hold assets built for
-        # different runtimes without changing.
-        manifest = {"format_version": FORMAT_VERSION, "source_commit": commit, "assets": entries}
-        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        for name, data in archives:
+            with open(staging / f"{name}.zip", "xb") as archive:
+                archive.write(data)
+        (staging / "SHA256SUMS").write_text(sums)
+        (staging / "manifest.json").write_text(manifest_text)
         if output.exists():
             output.rmdir()
         staging.rename(output)
     return manifest
+
+
+def check_release(repo, release, revision, config_path):
+    """Fail unless `release` holds exactly the files `package` writes for its ZIPs and the commit.
+
+    Builds nothing and runs no code from the repository: it reads the config as committed,
+    requires each ZIP to be canonical and to follow the packaging rules, and recomputes
+    SHA256SUMS and manifest.json from the ZIPs, requiring them byte for byte. Returns the
+    SHA256SUMS text.
+    """
+    commit = resolve_commit(repo, revision)
+    config = read_config(repo, commit, config_path)
+    present = sorted(p.name for p in release.iterdir())
+    for name in present:
+        if (release / name).is_symlink() or not (release / name).is_file():
+            raise ReleaseError(f"{name} is not a regular file")
+    names = [name[:-len(".zip")] for name in present if name.endswith(".zip")]
+    check_names(names)
+    configured = {asset["name"]: asset.get("files") for asset in config["assets"]}
+    allowed = set(names) if "assets_from" in config else set(configured)
+    expected_files = sorted({f"{name}.zip" for name in allowed | set(configured)} | {"SHA256SUMS", "manifest.json"})
+    if present != expected_files:
+        missing, extra = sorted(set(expected_files) - set(present)), sorted(set(present) - set(expected_files))
+        raise ReleaseError(f"{release} must hold exactly lambda-build's files; "
+                           f"missing {missing or 'none'}, unexpected {extra or 'none'}")
+    archives, file_lists = [], []
+    executables = set(config["executable"])
+    for name in sorted(names):
+        data = (release / f"{name}.zip").read_bytes()
+        try:
+            with ZipFile(BytesIO(data)) as bundle:
+                infos = bundle.infolist()
+                entries = [(info.filename, bundle.read(info)) for info in infos]
+        except (BadZipFile, OSError, ValueError) as error:
+            raise ReleaseError(f"{name}.zip is not a readable ZIP ({error})") from None
+        files = [path for path, _ in entries]
+        for path in files:
+            parts = PurePosixPath(path).parts
+            if path.startswith("/") or path.endswith("/") or ".." in parts:
+                raise ReleaseError(f"{name}.zip: unsafe entry {path!r}")
+        check_asset(name, sorted(files), sum(len(content) for _, content in entries), configured.get(name), config)
+        canonical = zip_bytes([(path, content, path in executables) for path, content in sorted(entries)])
+        if canonical != data:
+            raise ReleaseError(f"{name}.zip is not the canonical ZIP lambda-build writes for its files "
+                               "(stored, sorted, fixed timestamps and permissions)")
+        archives.append((name, data))
+        file_lists.append(files)
+    check_executables(config, file_lists)
+    sums, _, manifest_text = release_metadata(commit, config, archives)
+    if (release / "SHA256SUMS").read_bytes() != sums.encode():
+        raise ReleaseError("SHA256SUMS does not match what lambda-build writes for these ZIPs")
+    if (release / "manifest.json").read_bytes() != manifest_text.encode():
+        raise ReleaseError(f"manifest.json does not match what lambda-build writes for these ZIPs and {commit}")
+    return sums
 
 
 # Git reads objects only: no system or global config, attributes, or replace refs, so the
@@ -389,13 +479,19 @@ def main(argv=None):
     source.add_argument("--tag", help="GitHub release tag to download with gh; needs --repository")
     source.add_argument("--release-dir", type=Path, help="directory holding exactly the release's ZIPs, SHA256SUMS, and manifest.json")
     verify_parser.add_argument("--repository", help="OWNER/NAME of the GitHub repository that published --tag")
-    for command in (package_parser, verify_parser):
+    check_parser = commands.add_parser("check", help="confirm a release directory is exactly what lambda-build writes, without building")
+    check_parser.add_argument("--release-dir", type=Path, required=True, help="directory holding the release files")
+    check_parser.add_argument("--commit", required=True, help="commit the release was built from")
+    for command in (package_parser, verify_parser, check_parser):
         command.add_argument("--repo", type=Path, default=Path("."), help="Git repository holding the source (default: .)")
         command.add_argument("--config", default=CONFIG, help=f"config path inside the commit (default: {CONFIG})")
     args = parser.parse_args(argv)
     if args.command == "verify" and args.tag and not args.repository:
         parser.error("--tag needs --repository")
     try:
+        if args.command == "check":
+            print(check_release(args.repo, args.release_dir, args.commit, args.config), end="")
+            return 0
         if args.command == "package":
             manifest = package_commit(args.repo, args.commit, args.config, args.output)
             for entry in manifest["assets"]:

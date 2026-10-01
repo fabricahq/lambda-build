@@ -99,9 +99,19 @@ jobs:
 
 Download the `release-assets` artifact in a later job to smoke-test what you ship.
 
+## Check release files before publishing
+
+A repository that publishes the `release-assets` artifact with its own job, rather than through Release Planner, should check the downloaded files first:
+
+```sh
+python3 lambda_build.py check --release-dir release --commit "$SOURCE_COMMIT"
+```
+
+`check` builds nothing and runs no code from the repository. It reads `lambda-build.toml` as committed at that commit, requires each ZIP to be the canonical ZIP for its files and to follow the packaging rules, and recomputes `SHA256SUMS` and `manifest.json` from the ZIPs. The directory must hold exactly those files, byte for byte. It prints `SHA256SUMS` on success. Run the `lambda_build.py` from the lambda-build commit that built the files, with the repository checked out at that commit or any clone that contains it.
+
 ## Build or verify on your machine
 
-You need Python 3.11 or later, Git, and Docker. From a clone of the application repository:
+You need Python 3.11 or later, Git, and, to build or verify, Docker. From a clone of the application repository:
 
 ```sh
 # Build HEAD twice and write its release files.

@@ -29,8 +29,8 @@ jobs:
       config: examples/go-function/lambda-build.toml
 
   fixture-check:
-    # Require the digest a macOS developer machine produced for the same fixture, and rebuild
-    # the files with verify.
+    # Require the digest a macOS developer machine produced for the same fixture, check the
+    # files as a publish job would, and rebuild them with verify.
     needs: fixture-build
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
@@ -42,12 +42,13 @@ jobs:
         with:
           name: release-assets
           path: ${{ runner.temp }}/release
-      - name: Compare and verify
+      - name: Compare, check, and verify
         env:
           RELEASE_DIR: ${{ runner.temp }}/release
         run: |
           set -euo pipefail
           diff examples/go-function/expected-SHA256SUMS "$RELEASE_DIR/SHA256SUMS"
+          python3 lambda_build.py check --release-dir "$RELEASE_DIR" --commit "$GITHUB_SHA" --config examples/go-function/lambda-build.toml
           python3 lambda_build.py verify --release-dir "$RELEASE_DIR" --config examples/go-function/lambda-build.toml
 
   lint:
