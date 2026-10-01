@@ -111,7 +111,7 @@ python3 lambda_build.py package --output build/release-assets
 python3 lambda_build.py verify --repository OWNER/NAME --tag v1.2.3
 ```
 
-`verify` downloads every file of the release with `gh` and requires each ZIP, `SHA256SUMS`, and `manifest.json` to match the rebuild byte for byte, with no file missing or extra. The source commit must be in your clone. It reads `lambda-build.toml` as committed at that commit. Use the `lambda_build.py` from the commit of this repository that the release's workflow pinned. `--help` lists every option.
+`verify` downloads every file of the release with `gh` and requires each ZIP, `SHA256SUMS`, and `manifest.json` to match the rebuild byte for byte, with no file missing or extra. A release holds exactly lambda-build's output, because Release Planner publishes exactly the files in the `release-assets` artifact, so attach nothing else to it. The source commit must be in your clone. It reads `lambda-build.toml` as committed at that commit. Use the `lambda_build.py` from the commit of this repository that the release's workflow pinned. `--help` lists every option.
 
 ## Develop
 
