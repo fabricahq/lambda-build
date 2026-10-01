@@ -73,8 +73,11 @@ class PackagingTests(unittest.TestCase):
         archive = (release / "api.zip").read_bytes()
         digest = hashlib.sha256(archive).hexdigest()
         self.assertEqual((release / "SHA256SUMS").read_text(), f"{digest}  api.zip\n")
-        expected = {"format_version": 2, "source_commit": COMMIT, "runtime": "nodejs24.x", "architecture": "arm64",
-                    "assets": [{"name": "api", "asset": "api.zip", "sha256": digest, "size": len(archive)}]}
+        # Runtime and architecture belong to each asset, so a repository can later build assets for
+        # several runtimes without a new manifest format.
+        expected = {"format_version": 2, "source_commit": COMMIT,
+                    "assets": [{"name": "api", "asset": "api.zip", "sha256": digest, "size": len(archive),
+                                "runtime": "nodejs24.x", "architecture": "arm64"}]}
         self.assertEqual(manifest, expected)
         self.assertEqual(json.loads((release / "manifest.json").read_text()), expected)
         with ZipFile(release / "api.zip") as bundle:

@@ -18,7 +18,7 @@ lambda-build never tags or publishes. [Release Planner](https://github.com/fabri
 
 - `NAME.zip` for each function.
 - `SHA256SUMS`: one `<sha256>  NAME.zip` line per ZIP.
-- `manifest.json`: `format_version` 2, the full `source_commit`, `runtime`, `architecture`, and each asset's `name`, `asset`, `sha256`, and `size`.
+- `manifest.json`: `format_version` 2, the full `source_commit`, and each asset's `name`, `asset`, `sha256`, `size`, `runtime`, and `architecture`.
 
 Asset names use only letters, digits, `.`, `_`, and `-`, so every file name is one Release Planner accepts.
 

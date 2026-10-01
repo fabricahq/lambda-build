@@ -203,10 +203,12 @@ def package(root, config, commit, output):
             if size > MAX_ZIP_BYTES:
                 raise ReleaseError(f"{name}: {archive.name} exceeds Lambda's 50 MiB direct-upload limit")
             digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-            entries.append({"name": name, "asset": archive.name, "sha256": digest, "size": size})
+            entries.append({"name": name, "asset": archive.name, "sha256": digest, "size": size,
+                            "runtime": runtime, "architecture": config["architecture"]})
         (staging / "SHA256SUMS").write_text("".join(f"{e['sha256']}  {e['asset']}\n" for e in entries))
-        manifest = {"format_version": FORMAT_VERSION, "source_commit": commit, "runtime": runtime,
-                    "architecture": config["architecture"], "assets": entries}
+        # Runtime and architecture describe each asset, so the format can hold assets built for
+        # different runtimes without changing.
+        manifest = {"format_version": FORMAT_VERSION, "source_commit": commit, "assets": entries}
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         if output.exists():
             output.rmdir()
