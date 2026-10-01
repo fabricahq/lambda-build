@@ -13,11 +13,10 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import sys
-import tarfile
 import tempfile
 import tomllib
 from zipfile import ZIP_STORED, ZipFile, ZipInfo
@@ -215,9 +214,16 @@ def package(root, config, commit, output):
     return manifest
 
 
+# Git reads objects only: no system or global config, attributes, or replace refs, so the
+# local clone's settings cannot change what a commit means.
+GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_ATTR_NOSYSTEM": "1",
+           "GIT_NO_REPLACE_OBJECTS": "1", "GIT_TERMINAL_PROMPT": "0"}
+
+
 def git(repo, *args, **kwargs):
     """Run Git in `repo`, returning stdout, and turn its failure into a ReleaseError."""
-    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, **kwargs)
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                            env={**os.environ, **GIT_ENV}, **kwargs)
     if result.returncode != 0:
         message = result.stderr.decode(errors="replace").strip() if isinstance(result.stderr, bytes) else result.stderr.strip()
         raise ReleaseError(f"git {' '.join(args)}: {message}")
@@ -234,17 +240,49 @@ def resolve_commit(repo, revision):
 
 def read_config(repo, commit, path):
     """Read and validate the release config as committed, ignoring uncommitted edits."""
-    return parse_config(git(repo, "show", f"{commit}:{path}", text=True))
+    return parse_config(git(repo, "cat-file", "blob", f"{commit}:{path}", text=True))
 
 
 def export(repo, commit, destination):
-    """Write the committed tree to `destination`, without .git, untracked files, or credentials."""
-    archive = git(repo, "archive", "--format=tar", commit)
-    with tempfile.TemporaryFile() as buffer:
-        buffer.write(archive)
-        buffer.seek(0)
-        with tarfile.open(fileobj=buffer) as tar:
-            tar.extractall(destination, filter="data")
+    """Write the committed tree to `destination`, without .git, untracked files, or credentials.
+
+    Reads the tree and its blobs directly rather than through `git archive`, so no attribute
+    (export-ignore, export-subst, eol) or local config such as core.autocrlf can change a file.
+    Submodules become empty directories.
+    """
+    entries = []
+    for record in git(repo, "ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0"):
+        if record:
+            meta, path = record.split(b"\t", 1)
+            mode, kind, oid = meta.decode().split(" ")
+            relative = PurePosixPath(os.fsdecode(path))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ReleaseError(f"{commit}: unsafe path {relative} in the tree")
+            entries.append((mode, kind, oid, destination.joinpath(*relative.parts)))
+    root = destination.resolve()
+    with subprocess.Popen(["git", "-C", str(repo), "cat-file", "--batch"], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, env={**os.environ, **GIT_ENV}) as reader:
+        for mode, kind, oid, target in entries:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if kind == "commit":
+                target.mkdir(exist_ok=True)
+                continue
+            reader.stdin.write(f"{oid}\n".encode())
+            reader.stdin.flush()
+            header = reader.stdout.readline().split()
+            data = reader.stdout.read(int(header[2]))
+            reader.stdout.read(1)  # the newline after each object
+            if mode == "120000":
+                link = os.fsdecode(data)
+                if os.path.isabs(link) or not (target.parent / link).resolve().is_relative_to(root):
+                    raise ReleaseError(f"{target.relative_to(destination)} links outside the tree")
+                target.symlink_to(link)
+            else:
+                target.write_bytes(data)
+                target.chmod(0o755 if mode == "100755" else 0o644)
+        reader.stdin.close()
+        if reader.wait() != 0:
+            raise ReleaseError(f"git cat-file could not read the tree of {commit}")
 
 
 def run_build(image, architecture, command, root):

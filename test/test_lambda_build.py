@@ -194,6 +194,61 @@ class StagingTests(unittest.TestCase):
             self.assertEqual(list(output.parent.glob(".release-*")), [])
 
 
+class ExportTests(unittest.TestCase):
+    """The build input is the committed tree, whatever the local clone's settings say."""
+
+    def test_local_attributes_and_config_cannot_change_the_export(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            git = ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com"]
+            subprocess.run([*git, "init", "-q"], check=True)
+            contents = {"src/ignored.txt": b"kept\n", "src/subst.txt": b"$Format:%H$\n", "src/crlf.txt": b"one\ntwo\n"}
+            for relative, data in contents.items():
+                (repo / relative).parent.mkdir(parents=True, exist_ok=True)
+                (repo / relative).write_bytes(data)
+            (repo / "run.sh").write_bytes(b"#!/bin/sh\n")
+            (repo / "run.sh").chmod(0o755)
+            subprocess.run([*git, "add", "-A"], check=True)
+            subprocess.run([*git, "commit", "-q", "-m", "source"], check=True)
+            commit = lambda_build.resolve_commit(repo, "HEAD")
+            # None of these are committed, so none may change what is built.
+            (repo / ".git/info/attributes").write_text(
+                "src/ignored.txt export-ignore\nsrc/subst.txt export-subst\nsrc/crlf.txt text eol=crlf\n")
+            subprocess.run([*git, "config", "core.autocrlf", "true"], check=True)
+
+            destination = Path(temporary) / "export"
+            destination.mkdir()
+            lambda_build.export(repo, commit, destination)
+            exported = {p.relative_to(destination).as_posix(): p.read_bytes()
+                        for p in destination.rglob("*") if p.is_file()}
+            self.assertEqual(exported, {**contents, "run.sh": b"#!/bin/sh\n"})
+            self.assertTrue(os.access(destination / "run.sh", os.X_OK))
+
+    def test_recreates_links_inside_the_tree_and_rejects_links_outside(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            git = ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com"]
+            subprocess.run([*git, "init", "-q"], check=True)
+            (repo / "run.sh").write_text("#!/bin/sh\n")
+            (repo / "link.sh").symlink_to("run.sh")
+            subprocess.run([*git, "add", "-A"], check=True)
+            subprocess.run([*git, "commit", "-q", "-m", "inside"], check=True)
+            inside = Path(temporary) / "inside"
+            inside.mkdir()
+            lambda_build.export(repo, lambda_build.resolve_commit(repo, "HEAD"), inside)
+            self.assertEqual(os.readlink(inside / "link.sh"), "run.sh")
+
+            (repo / "escape").symlink_to("/etc")
+            subprocess.run([*git, "add", "-A"], check=True)
+            subprocess.run([*git, "commit", "-q", "-m", "outside"], check=True)
+            outside = Path(temporary) / "outside"
+            outside.mkdir()
+            with self.assertRaisesRegex(lambda_build.ReleaseError, "links outside the tree"):
+                lambda_build.export(repo, lambda_build.resolve_commit(repo, "HEAD"), outside)
+
+
 class ConfigTests(unittest.TestCase):
     def assert_invalid(self, message, **settings):
         with self.assertRaisesRegex(lambda_build.ReleaseError, message):
