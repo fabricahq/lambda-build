@@ -352,6 +352,18 @@ class ContainerTests(unittest.TestCase):
         self.assertIn("build/link is a symlink", result.stderr)
         self.assertFalse((self.root / "release").exists())
 
+    def test_the_image_entrypoint_cannot_swallow_the_build(self):
+        # An entrypoint that ignores its arguments and succeeds would skip the build silently.
+        image = "lambda-build-test-entrypoint:local"
+        dockerfile = f"FROM {BUSYBOX}\nENTRYPOINT [\"/bin/echo\", \"entrypoint ran instead\"]\n"
+        subprocess.run(["docker", "build", "--quiet", "--platform", "linux/arm64", "--tag", image, "-"],
+                       input=dockerfile, text=True, check=True, capture_output=True)
+        self.addCleanup(subprocess.run, ["docker", "image", "rm", "--force", image], capture_output=True)
+        root = self.root / "tree"
+        root.mkdir()
+        lambda_build.run_build(image, "arm64", "echo built > built.txt", root)
+        self.assertEqual((root / "built.txt").read_text(), "built\n")
+
     def test_verify_needs_the_release_source_commit(self):
         release = self.root / "release"
         release.mkdir()

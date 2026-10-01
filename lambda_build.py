@@ -292,7 +292,8 @@ def run_build(image, architecture, command, root):
     subprocess.run(["docker", "run", "--rm", "--platform", PLATFORMS[architecture],
                     "--user", f"{os.getuid()}:{os.getgid()}", "--env", "HOME=/tmp/home",
                     "--volume", f"{root.resolve()}:/src", "--workdir", "/src",
-                    image, "/bin/sh", "-ec", command], check=True, stdout=sys.stderr)
+                    # Replace the image's entrypoint, which could otherwise ignore the command.
+                    "--entrypoint", "/bin/sh", image, "-ec", command], check=True, stdout=sys.stderr)
 
 
 def build(repo, commit, config, output):
