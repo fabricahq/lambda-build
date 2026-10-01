@@ -19,6 +19,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -30,8 +31,12 @@ FORMAT_VERSION = 3
 # Lambda rejects direct uploads above these sizes. Stored entries make each ZIP slightly larger than its files.
 MAX_ZIP_BYTES = 50 * 1024 * 1024
 MAX_UNPACKED_BYTES = 250 * 1024 * 1024
-# The canonical writer uses no Zip64 extensions, which caps a ZIP at 65535 entries.
-MAX_FILES = 65535
+# The canonical writer uses no Zip64 extensions; Python's zipfile needs them from 65535 entries.
+MAX_FILES = 65534
+# A documented cap on ZIPs per release, so check's work and memory stay bounded with assets_from.
+MAX_ASSETS = 100
+# The end-of-central-directory record that ends every ZIP lambda-build writes, with no comment.
+END_RECORD = struct.Struct("<4s4H2LH")
 # Paths a Linux filesystem accepts: 255-byte names (NAME_MAX), and a cap on the whole path that
 # also bounds its depth.
 MAX_NAME_BYTES = 255
@@ -169,10 +174,12 @@ def check_name(name):
 
 
 def check_names(names, allow_empty=False):
-    """Fail on an empty asset set, or on names that differ only in case, which a case-insensitive
-    filesystem stores as one ZIP."""
+    """Fail on an empty or oversized asset set, or on names that differ only in case, which a
+    case-insensitive filesystem stores as one ZIP."""
     if not names and not allow_empty:
         raise ReleaseError("There are no assets to package")
+    if len(names) > MAX_ASSETS:
+        raise ReleaseError(f"There are more than {MAX_ASSETS} assets to package")
     if len({name.casefold() for name in names}) != len(set(names)):
         raise ReleaseError(f"Asset names {sorted(names)} must not differ only in case")
 
@@ -260,11 +267,13 @@ def check_asset(name, files, unpacked_size, expected, config):
                            "add bootstrap to executable")
 
 
-def check_executables(config, file_lists):
-    """Fail when an `executable` path matches no file in any asset, which usually means a typo."""
-    for path in sorted(set(config["executable"])):
-        if not any(path in files for files in file_lists):
-            raise ReleaseError(f"executable {path} matches no packaged file")
+def check_executables(config, found):
+    """Fail when an `executable` path matches no file in any asset, which usually means a typo.
+
+    `found` is the set of `executable` paths seen in any asset.
+    """
+    for path in sorted(set(config["executable"]) - set(found)):
+        raise ReleaseError(f"executable {path} matches no packaged file")
 
 
 def zip_bytes(entries):
@@ -309,7 +318,7 @@ def package(root, config, commit, output):
         files = collect(directory)
         check_asset(name, files, sum((directory / f).stat().st_size for f in files), expected, config)
         contents[name] = (directory, files)
-    check_executables(config, [files for _, files in contents.values()])
+    check_executables(config, {path for _, files in contents.values() for path in files if path in executables})
     archives = [(name, zip_bytes([(f, (directory / f).read_bytes(), f in executables) for f in files]))
                 for name, (directory, files) in contents.items()]
     sums, manifest, manifest_text = release_metadata(
@@ -347,12 +356,35 @@ def read_member(directory, name, limit, too_large):
     return data
 
 
+def check_end_record(name, data):
+    """Fail unless `data` ends with the plain end record lambda-build writes, before zipfile parses
+    the central directory: no comment or trailing bytes, no Zip64, one disk, at most MAX_FILES
+    entries, and a central directory directly before the record and no larger than its entries need.
+    """
+    if len(data) < END_RECORD.size:
+        raise ReleaseError(f"{name}.zip is too short to be a ZIP")
+    end = len(data) - END_RECORD.size
+    signature, disk, directory_disk, disk_entries, entries, size, offset, comment = END_RECORD.unpack_from(data, end)
+    if signature != b"PK\x05\x06" or comment:
+        raise ReleaseError(f"{name}.zip does not end with a plain end record (lambda-build writes no comment or trailing bytes)")
+    if 0xFFFF in (disk_entries, entries) or 0xFFFFFFFF in (size, offset) or data[max(0, end - 20):end][:4] == b"PK\x06\x07":
+        raise ReleaseError(f"{name}.zip uses Zip64, which lambda-build never writes")
+    if disk or directory_disk or disk_entries != entries:
+        raise ReleaseError(f"{name}.zip spans several disks")
+    if entries > MAX_FILES:
+        raise ReleaseError(f"{name}: more than {MAX_FILES} files, the most a ZIP without Zip64 holds")
+    # A central directory record is 46 bytes plus its file name, and lambda-build adds no extras.
+    if offset + size != end or size > entries * (46 + MAX_PATH_BYTES):
+        raise ReleaseError(f"{name}.zip has a central directory that does not match its end record")
+
+
 def read_zip_entries(name, data, expected, config):
     """Return the (path, bytes) entries of an untrusted ZIP after the checks that need no file contents.
 
     Rejects anything but stored entries and applies the shared asset rules before reading entry
     data, so no entry is decompressed and memory stays within the archive's own size.
     """
+    check_end_record(name, data)
     try:
         with ZipFile(BytesIO(data)) as bundle:
             infos = bundle.infolist()
@@ -401,7 +433,7 @@ def check_release(repo, release, revision, config_path):
             missing, extra = sorted(set(expected_files) - set(present)), sorted(set(present) - set(expected_files))
             raise ReleaseError(f"{release} must hold exactly lambda-build's files; "
                                f"missing {missing or 'none'}, unexpected {extra or 'none'}")
-        archives, file_lists = [], []
+        archives, found = [], set()
         executables = set(config["executable"])
         for name in sorted(names):
             data = read_member(directory, f"{name}.zip", MAX_ZIP_BYTES,
@@ -412,9 +444,9 @@ def check_release(repo, release, revision, config_path):
                 raise ReleaseError(f"{name}.zip is not the canonical ZIP lambda-build writes for its files "
                                    "(stored, sorted, fixed timestamps and permissions)")
             archives.append((name, hashlib.sha256(data).hexdigest(), len(data)))
-            file_lists.append([path for path, _ in entries])
+            found.update(executables.intersection(path for path, _ in entries))
             del data, entries, canonical
-        check_executables(config, file_lists)
+        check_executables(config, found)
         sums, _, manifest_text = release_metadata(commit, config, archives)
         for name, text in (("SHA256SUMS", sums), ("manifest.json", manifest_text)):
             expected = text.encode()

@@ -424,7 +424,7 @@ class HostileReleaseTests(unittest.TestCase):
             for index in range(65536):
                 bundle.writestr(ZipInfo(f"f{index:05d}", (1980, 1, 1, 0, 0, 0)), b"")
         self.write_release(commit, {"api": buffer.getvalue()})
-        self.assert_check_blocks(commit, "more than 65535 files")
+        self.assert_check_blocks(commit, "api.zip uses Zip64")
 
     def test_rejects_oversized_files_before_reading_them(self):
         commit = self.commit_config({**self.NODE, "assets_from": "build"})
@@ -454,8 +454,67 @@ class HostileReleaseTests(unittest.TestCase):
         commit = self.commit_config({**self.NODE, "assets_from": "build"})
         self.write_release(commit, {"api": self.stored_zip([("a/" * 32000 + "f", b"x")])})
         started = time.monotonic()
-        self.assert_check_blocks(commit, "longer than 1024 bytes")
+        # The end record already shows a central directory too large for one entry's 1024-byte path.
+        self.assert_check_blocks(commit, "central directory that does not match its end record")
         self.assertLess(time.monotonic() - started, 5)
+
+    def check_peak(self, commit):
+        """Run check in this process and return its peak traced allocation in bytes."""
+        tracemalloc.start()
+        try:
+            lambda_build.check_release(self.repo, self.release, commit, "lambda-build.toml")
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    def test_memory_does_not_grow_with_the_number_of_zips(self):
+        # Each ZIP's 10,000 paths once stayed in memory until every ZIP had been read.
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        zip_data = self.stored_zip([(f"{index:05d}-" + "n" * 100, b"") for index in range(10000)])
+        self.write_release(commit, {"f0": zip_data})
+        one = self.check_peak(commit)
+        for path in self.release.iterdir():
+            path.unlink()
+        self.write_release(commit, {f"f{index}": zip_data for index in range(8)})
+        eight = self.check_peak(commit)
+        self.assertLess(eight, one + 3 * 1024 * 1024, f"one ZIP peaked at {one} bytes, eight at {eight}")
+
+    def test_caps_the_number_of_assets(self):
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        self.write_release(commit, {f"f{index:03d}": self.stored_zip([("index.mjs", b"x")]) for index in range(101)})
+        self.assert_check_blocks(commit, "more than 100 assets")
+        with self.assertRaisesRegex(lambda_build.ReleaseError, "more than 100 assets"):
+            lambda_build.check_names([f"f{index}" for index in range(101)])
+        lambda_build.check_names([f"f{index}" for index in range(100)])
+
+    def test_refuses_oversized_central_directories_before_parsing_them(self):
+        # 100,000 records once allocated about 37 MiB in ZipFile before the count was checked.
+        buffer = io.BytesIO()
+        with ZipFile(buffer, "w") as bundle:
+            for index in range(100000):
+                bundle.writestr(ZipInfo(f"f{index:06d}", (1980, 1, 1, 0, 0, 0)), b"")
+        data = buffer.getvalue()
+        config = lambda_build.parse_config(toml({**self.NODE, "assets_from": "build"}))
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(lambda_build.ReleaseError, "api.zip uses Zip64"):
+                lambda_build.read_zip_entries("api", data, None, config)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 1024 * 1024)
+
+    def test_refuses_archives_that_are_not_one_plain_central_directory(self):
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        valid = self.stored_zip([("index.mjs", b"x")])
+        cases = {"a trailing comment": (valid[:-2] + b"\x02\x00hi", "end record"),
+                 "bytes after the end record": (valid + b"x", "end record")}
+        for label, (data, message) in cases.items():
+            with self.subTest(label):
+                for path in self.release.iterdir():
+                    path.unlink()
+                self.write_release(commit, {"api": data})
+                self.assert_check_blocks(commit, message)
 
     def test_rejects_empty_releases_and_empty_zips(self):
         commit = self.commit_config({**self.NODE, "assets_from": "build"})
@@ -587,6 +646,13 @@ class PathLimitTests(unittest.TestCase):
         finally:
             tracemalloc.stop()
         self.assertLess(peak, 8 * 1024 * 1024)
+
+    def test_limits_a_zip_to_the_entries_the_writer_supports(self):
+        # Python's zipfile switches to Zip64 at 65535 entries, which the canonical writer refuses.
+        files = [f"f{index:05d}" for index in range(65534)]
+        self.assert_paths(files)
+        lambda_build.check_end_record("api", lambda_build.zip_bytes([(path, b"", False) for path in files]))
+        self.assert_paths(files + ["g"], "more than 65534 files")
 
     def test_rejects_nul_in_paths(self):
         self.assert_paths(["a\0b"], "contains a NUL")
