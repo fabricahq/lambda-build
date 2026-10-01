@@ -1,0 +1,65 @@
+name: Build Lambda release assets
+# Reusable build job: checks out one commit, builds it twice in the container image pinned by
+# its lambda-build.toml, requires identical files, and uploads the ZIPs, SHA256SUMS, and
+# manifest.json as the release-assets artifact that Release Planner attests and publishes.
+# It owns the job so the job can only read the repository, whatever the caller grants, and it
+# never tags or publishes.
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Full SHA of the commit to build, such as the ref input Release Planner passes, or github.sha.
+        type: string
+        required: true
+      config:
+        description: Path of the build config inside the commit.
+        type: string
+        default: lambda-build.toml
+      runs-on:
+        description: Runner label. Match the Lambda architecture, or the build runs under emulation if the runner supports it.
+        type: string
+        default: ubuntu-24.04-arm
+permissions: {}
+jobs:
+  build:
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse pull_request_target and anything but a full commit SHA
+        env:
+          REF: ${{ inputs.ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request_target ]]; then
+            echo "::error::pull_request_target runs untrusted code with the base repository's privileges; build on pull_request instead"
+            exit 1
+          fi
+          if [[ ! "$REF" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "::error::ref must be a full commit SHA, not '$REF', so the build names exactly one commit"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      # The packager comes from the same commit as this workflow, not from the caller.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .lambda-build-tool
+          persist-credentials: false
+      - name: Build twice in the pinned container and package
+        env:
+          CONFIG: ${{ inputs.config }}
+          REF: ${{ inputs.ref }}
+        run: python3 .lambda-build-tool/lambda_build.py package --commit "$REF" --config "$CONFIG" --output "$RUNNER_TEMP/release-assets"
+      # Release Planner requires one artifact named release-assets with the files at its top level.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+          retention-days: 14

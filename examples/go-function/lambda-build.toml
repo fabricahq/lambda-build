@@ -1,0 +1,11 @@
+# Build settings for the Go fixture; paths are relative to the repository root.
+runtime = "provided.al2023"
+architecture = "arm64"
+image = "golang:1.26.7-bookworm@sha256:e8c859f5632dcfde7b32d2012b4351728f6437930887c2f6a91ea242459e5514"
+build = """
+cd examples/go-function
+GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+  go build -trimpath -buildvcs=false -ldflags='-s -w' -o ../../build/functions/hello/bootstrap .
+"""
+assets_from = "build/functions"
+executable = ["bootstrap"]
