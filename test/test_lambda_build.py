@@ -75,7 +75,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual((release / "SHA256SUMS").read_text(), f"{digest}  api.zip\n")
         # Runtime and architecture belong to each asset, so a repository can later build assets for
         # several runtimes without a new manifest format.
-        expected = {"format_version": 2, "source_commit": COMMIT,
+        expected = {"format_version": 3, "source_commit": COMMIT,
                     "assets": [{"name": "api", "asset": "api.zip", "sha256": digest, "size": len(archive),
                                 "runtime": "nodejs24.x", "architecture": "arm64"}]}
         self.assertEqual(manifest, expected)
@@ -442,11 +442,17 @@ class ContainerTests(unittest.TestCase):
     def test_verify_needs_the_release_source_commit(self):
         release = self.root / "release"
         release.mkdir()
-        (release / "manifest.json").write_text(json.dumps({"format_version": 2, "source_commit": "b" * 40}))
+        (release / "manifest.json").write_text(json.dumps({"format_version": 3, "source_commit": "b" * 40}))
         self.commit("true")
         result = self.cli("verify", "--release-dir", str(release))
         self.assertEqual(result.returncode, 1)
         self.assertIn("fetch it first", result.stderr)
+
+        # A manifest from another format version is not this tool's to rebuild.
+        (release / "manifest.json").write_text(json.dumps({"format_version": 2, "source_commit": "b" * 40}))
+        result = self.cli("verify", "--release-dir", str(release))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("is not a format 3 Lambda release manifest", result.stderr)
 
 
 if __name__ == "__main__":

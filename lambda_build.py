@@ -21,7 +21,8 @@ import tempfile
 import tomllib
 from zipfile import ZIP_STORED, ZipFile, ZipInfo
 
-FORMAT_VERSION = 2
+# Format 3 records runtime and architecture on each asset; format 2 recorded them once per release.
+FORMAT_VERSION = 3
 # Lambda rejects direct uploads above these sizes. Stored entries make each ZIP slightly larger than its files.
 MAX_ZIP_BYTES = 50 * 1024 * 1024
 MAX_UNPACKED_BYTES = 250 * 1024 * 1024
