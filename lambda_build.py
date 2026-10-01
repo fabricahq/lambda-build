@@ -250,9 +250,10 @@ def export(repo, commit, destination):
 
     Reads the tree and its blobs directly rather than through `git archive`, so no attribute
     (export-ignore, export-subst, eol) or local config such as core.autocrlf can change a file.
-    Submodules become empty directories.
+    Rejects paths that differ only in case before writing anything. Submodules become empty
+    directories.
     """
-    entries = []
+    entries, seen = [], {}
     for record in git(repo, "ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0"):
         if record:
             meta, path = record.split(b"\t", 1)
@@ -261,6 +262,15 @@ def export(repo, commit, destination):
             if relative.is_absolute() or ".." in relative.parts:
                 raise ReleaseError(f"{commit}: unsafe path {relative} in the tree")
             entries.append((mode, kind, oid, destination.joinpath(*relative.parts)))
+            # Paths, including their directories, that differ only in case are one path on a
+            # case-insensitive filesystem; both builds would silently lose the same file.
+            for depth in range(1, len(relative.parts) + 1):
+                prefix = "/".join(relative.parts[:depth])
+                other = seen.setdefault(prefix.casefold(), prefix)
+                if other != prefix:
+                    first, second = sorted((other, prefix))
+                    raise ReleaseError(f"{commit}: {first} and {second} differ only in case, "
+                                       "so one would overwrite the other on a case-insensitive filesystem")
     root = destination.resolve()
     with subprocess.Popen(["git", "-C", str(repo), "cat-file", "--batch"], stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, env={**os.environ, **GIT_ENV}) as reader:
@@ -280,7 +290,8 @@ def export(repo, commit, destination):
                     raise ReleaseError(f"{target.relative_to(destination)} links outside the tree")
                 target.symlink_to(link)
             else:
-                target.write_bytes(data)
+                with open(target, "xb") as file:  # exclusive: never replace a file already written
+                    file.write(data)
                 target.chmod(0o755 if mode == "100755" else 0o644)
         reader.stdin.close()
         if reader.wait() != 0:

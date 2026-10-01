@@ -252,6 +252,58 @@ class ExportTests(unittest.TestCase):
                 lambda_build.export(repo, lambda_build.resolve_commit(repo, "HEAD"), outside)
 
 
+class CaseCollisionTests(unittest.TestCase):
+    """Committed paths that differ only in case would overwrite each other on macOS and Windows."""
+
+    def commit_tree(self, repo, layout):
+        """Commit `layout` ({path: bytes or nested dict}) with plumbing, which works on any filesystem."""
+        def tree(entries):
+            lines = []
+            for name, value in entries.items():
+                if isinstance(value, dict):
+                    lines.append(f"040000 tree {tree(value)}\t{name}")
+                else:
+                    blob = self.git(repo, "hash-object", "-w", "--stdin", input=value)
+                    lines.append(f"100644 blob {blob}\t{name}")
+            return self.git(repo, "mktree", input="\n".join(lines).encode() + b"\n")
+        return self.git(repo, "commit-tree", tree(layout), "-m", "collide", input=b"")
+
+    def git(self, repo, *args, input):
+        return subprocess.run(["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                               *args], input=input, check=True, capture_output=True).stdout.decode().strip()
+
+    def assert_rejected(self, layout, message):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+            commit = self.commit_tree(repo, layout)
+            destination = Path(temporary) / "export"
+            destination.mkdir()
+            with self.assertRaisesRegex(lambda_build.ReleaseError, message):
+                lambda_build.export(repo, commit, destination)
+            self.assertEqual(list(destination.iterdir()), [], "nothing may be written before the check")
+
+    def test_rejects_files_that_differ_only_in_case(self):
+        self.assert_rejected({"A.txt": b"upper", "a.txt": b"lower"}, "A.txt and a.txt differ only in case")
+
+    def test_rejects_directories_that_differ_only_in_case(self):
+        self.assert_rejected({"Src": {"x": b"x"}, "src": {"y": b"y"}}, "Src and src differ only in case")
+
+    def test_files_are_created_exclusively(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repo = Path(temporary) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+            commit = self.commit_tree(repo, {"a.txt": b"committed"})
+            destination = Path(temporary) / "export"
+            destination.mkdir()
+            (destination / "a.txt").write_bytes(b"already here")
+            with self.assertRaises(FileExistsError):
+                lambda_build.export(repo, commit, destination)
+            self.assertEqual((destination / "a.txt").read_bytes(), b"already here")
+
+
 class ConfigTests(unittest.TestCase):
     def assert_invalid(self, message, **settings):
         with self.assertRaisesRegex(lambda_build.ReleaseError, message):
