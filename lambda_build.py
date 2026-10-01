@@ -1,15 +1,16 @@
 """Build a commit's Lambda functions in a pinned container and package reproducible release files.
 
-`package` exports the commit from Git, runs the build command from its lambda-build.toml
-twice inside the container image pinned there, and packages each build into ZIPs, SHA256SUMS,
-and manifest.json. It fails unless both packagings are byte-identical. `verify` rebuilds a
+`build` exports the commit from Git twice and runs the build command from its
+lambda-build.toml in each export, inside the container image pinned there. `package --builds`
+packages both builds into ZIPs, SHA256SUMS, and manifest.json and fails unless the two are
+byte-identical; plain `package` does both steps at once. `verify` rebuilds a
 published release from its manifest's source commit the same way and compares the files.
 `check` confirms, without building, that a release directory is exactly what `package` writes
 for its ZIPs and commit, so a publish job can trust it.
 
 Each ZIP stores its entries uncompressed, sorted by path, with a fixed timestamp and fixed
 permissions, so the same files always produce the same bytes. Requires Python 3.11+ and Git;
-`package` and `verify` also need Docker.
+`build`, `package`, and `verify` also need Docker.
 """
 import argparse
 import hashlib
@@ -57,6 +58,9 @@ IMAGE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}")
 # Builds run on the Lambda's own platform, so any tests the build runs exercise real binaries.
 PLATFORMS = {"arm64": "linux/arm64", "x86_64": "linux/amd64"}
 CONFIG = "lambda-build.toml"
+# What `build` writes and `package --builds` reads: two build trees and a record of what was built.
+BUILD_TREES = ("first", "second")
+BUILD_RECORD = "build.json"
 CONFIG_KEYS = {"image", "build", "runtime", "architecture", "assets", "assets_from", "executable"}
 ASSET_KEYS = {"name", "directory", "files"}
 
@@ -589,13 +593,92 @@ def run_build(image, architecture, command, root):
                     "--entrypoint", "/bin/sh", image, "-ec", command], check=True, stdout=sys.stderr)
 
 
+def build_tree(repo, commit, config, root):
+    """Export the commit into the empty directory `root` and run its build there, in the container."""
+    export(repo, commit, root)
+    run_build(config["image"], config["architecture"], config["build"], root)
+
+
 def build(repo, commit, config, output):
     """Export the commit, build it in the container, and package the result into `output`."""
     with tempfile.TemporaryDirectory(prefix="lambda-build-src-") as temporary:
         root = Path(temporary)
-        export(repo, commit, root)
-        run_build(config["image"], config["architecture"], config["build"], root)
+        build_tree(repo, commit, config, root)
         return package(root, config, commit, output)
+
+
+def require_new_or_empty(path, what):
+    """Fail unless `path` is missing or an empty directory, so nothing stale mixes with new output."""
+    if path.exists() and (not path.is_dir() or any(path.iterdir())):
+        raise ReleaseError(f"{path}: {what} must be a new or empty directory")
+
+
+def build_twice(repo, revision, config_path, builds):
+    """Build the commit twice, from two clean exports, into `builds`/first and `builds`/second.
+
+    Records the commit, the config path, and the config's blob in `builds`/build.json, so
+    `package_builds` can confirm the builds came from the commit and config it is given. Leaves
+    `builds` empty if either build fails.
+    """
+    commit = resolve_commit(repo, revision)
+    config = read_config(repo, commit, config_path)
+    config_blob = config_blob_of(repo, commit, config_path)
+    require_new_or_empty(builds, "the builds directory")
+    builds.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{builds.name}-", dir=builds.parent) as temporary:
+        staging = Path(temporary) / "builds"
+        for tree in BUILD_TREES:
+            (staging / tree).mkdir(parents=True)
+            build_tree(repo, commit, config, staging / tree)
+        record = {"source_commit": commit, "config": config_path, "config_blob": config_blob}
+        (staging / BUILD_RECORD).write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+        if builds.exists():
+            builds.rmdir()
+        staging.rename(builds)
+    return commit
+
+
+def config_blob_of(repo, commit, config_path):
+    """Return the Git blob ID of the config as committed, which identifies its exact contents."""
+    return git(repo, "rev-parse", "--verify", "--quiet", f"{commit}:{config_path}", text=True).strip()
+
+
+def package_builds(repo, builds, output, revision, config_path):
+    """Package the two builds that `build_twice` wrote, keeping the first only if both match.
+
+    `revision` and `config_path` are the trusted inputs. `builds`/build.json must record the same
+    commit, the same config path, and the blob of that config as committed, so a build record
+    cannot relabel builds as another commit or select another config.
+    """
+    commit = resolve_commit(repo, revision)
+    config = read_config(repo, commit, config_path)
+    try:
+        record = json.loads((builds / BUILD_RECORD).read_text())
+    except (OSError, ValueError) as error:
+        raise ReleaseError(f"{builds}: no readable {BUILD_RECORD} from lambda_build.py build ({error})") from None
+    if not isinstance(record, dict):
+        raise ReleaseError(f"{builds}/{BUILD_RECORD} is not a build record")
+    if record.get("source_commit") != commit:
+        raise ReleaseError(f"{BUILD_RECORD} records commit {record.get('source_commit')!r}, not {commit}")
+    if record.get("config") != config_path:
+        raise ReleaseError(f"{BUILD_RECORD} records config {record.get('config')}, not {config_path}")
+    if record.get("config_blob") != config_blob_of(repo, commit, config_path):
+        raise ReleaseError(f"{builds} was built with different {config_path} contents than {commit} holds")
+    require_new_or_empty(output, "output")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Stage both packagings beside the output, so nothing appears there unless both match.
+    with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as temporary:
+        first, second = (Path(temporary) / tree for tree in BUILD_TREES)
+        manifest = package(builds / BUILD_TREES[0], config, commit, first)
+        package(builds / BUILD_TREES[1], config, commit, second)
+        changed = differences(first, second)
+        if changed:
+            raise ReleaseError(f"Two builds of {commit} produced different {', '.join(changed)}; "
+                               "make the build reproducible")
+        if output.exists():
+            output.rmdir()
+        first.rename(output)
+    return manifest
 
 
 def file_digest(path):
@@ -627,25 +710,13 @@ def differences(first, second):
 
 
 def package_commit(repo, revision, config_path, output):
-    """Build the commit twice from clean exports and keep the first packaging only if both match."""
-    commit = resolve_commit(repo, revision)
-    config = read_config(repo, commit, config_path)
-    if output.exists() and (not output.is_dir() or any(output.iterdir())):
-        raise ReleaseError(f"{output}: output must be a new or empty directory, so no stale asset is published")
-    output.parent.mkdir(parents=True, exist_ok=True)
-    # Stage both packagings beside the output, so nothing appears there unless both builds finish and match.
-    with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as temporary:
-        first, repeat = Path(temporary) / "first", Path(temporary) / "repeat"
-        manifest = build(repo, commit, config, first)
-        build(repo, commit, config, repeat)
-        changed = differences(first, repeat)
-        if changed:
-            raise ReleaseError(f"Two builds of {commit} produced different {', '.join(changed)}; "
-                               "make the build reproducible")
-        if output.exists():
-            output.rmdir()
-        first.rename(output)
-    return manifest
+    """Build the commit twice from clean exports and keep the first packaging only if both match:
+    `build_twice` and `package_builds` in one step, with the builds in a temporary directory."""
+    require_new_or_empty(output, "output")
+    with tempfile.TemporaryDirectory(prefix="lambda-build-builds-") as temporary:
+        builds = Path(temporary) / "builds"
+        commit = build_twice(repo, revision, config_path, builds)
+        return package_builds(repo, builds, output, commit, config_path)
 
 
 def download_release(repository, tag, destination):
@@ -689,11 +760,25 @@ def verify(repo, release, config_path):
         return differences(release, rebuilt)
 
 
+def nonempty(value):
+    """argparse type that refuses an empty value instead of letting it fall back to a default."""
+    if not value:
+        raise argparse.ArgumentTypeError("must not be empty")
+    return value
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
-    package_parser = commands.add_parser("package", help="build a commit twice and write its release files")
-    package_parser.add_argument("--commit", default="HEAD", help="commit to build (default: HEAD)")
+    build_parser = commands.add_parser("build", help="build a commit twice in its pinned container, without packaging")
+    build_parser.add_argument("--commit", type=nonempty, default="HEAD", help="commit to build (default: HEAD)")
+    build_parser.add_argument("--output", type=Path, required=True,
+                              help="new or empty directory for the two build trees and build.json")
+    package_parser = commands.add_parser("package", help="package two builds into release files, building them first unless --builds")
+    package_parser.add_argument("--builds", type=Path,
+                                help="directory that lambda_build.py build wrote; package it without building. "
+                                     "Needs the same --commit and --config that build was given")
+    package_parser.add_argument("--commit", type=nonempty, help="commit to build (default: HEAD); required with --builds")
     package_parser.add_argument("--output", type=Path, required=True, help="new or empty directory for the release files")
     verify_parser = commands.add_parser("verify", help="rebuild a published release and compare its files")
     source = verify_parser.add_mutually_exclusive_group(required=True)
@@ -702,19 +787,33 @@ def main(argv=None):
     verify_parser.add_argument("--repository", help="OWNER/NAME of the GitHub repository that published --tag")
     check_parser = commands.add_parser("check", help="confirm a release directory is exactly what lambda-build writes, without building")
     check_parser.add_argument("--release-dir", type=Path, required=True, help="directory holding the release files")
-    check_parser.add_argument("--commit", required=True, help="commit the release was built from")
-    for command in (package_parser, verify_parser, check_parser):
+    check_parser.add_argument("--commit", type=nonempty, required=True, help="commit the release was built from")
+    for command in (build_parser, package_parser, verify_parser, check_parser):
         command.add_argument("--repo", type=Path, default=Path("."), help="Git repository holding the source (default: .)")
-        command.add_argument("--config", default=CONFIG, help=f"config path inside the commit (default: {CONFIG})")
+        command.add_argument("--config", type=nonempty,
+                             help=f"config path inside the commit (default: {CONFIG}); required with --builds")
     args = parser.parse_args(argv)
+    if args.command == "package" and args.builds is not None and (args.commit is None or args.config is None):
+        parser.error("--builds needs --commit and --config, the trusted inputs build was given, to check build.json against")
+    if args.config is None:
+        args.config = CONFIG
+    if args.command == "package" and args.commit is None:
+        args.commit = "HEAD"
     if args.command == "verify" and args.tag and not args.repository:
         parser.error("--tag needs --repository")
     try:
         if args.command == "check":
             print(check_release(args.repo, args.release_dir, args.commit, args.config), end="")
             return 0
+        if args.command == "build":
+            commit = build_twice(args.repo, args.commit, args.config, args.output)
+            print(f"Built {commit} twice into {args.output}", file=sys.stderr)
+            return 0
         if args.command == "package":
-            manifest = package_commit(args.repo, args.commit, args.config, args.output)
+            if args.builds is not None:
+                manifest = package_builds(args.repo, args.builds, args.output, args.commit, args.config)
+            else:
+                manifest = package_commit(args.repo, args.commit, args.config, args.output)
             for entry in manifest["assets"]:
                 print(f"{entry['sha256']}  {entry['asset']}")
             return 0

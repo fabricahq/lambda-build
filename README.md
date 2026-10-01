@@ -81,7 +81,7 @@ jobs:
       # runs-on: ubuntu-24.04-arm   # the default; match the Lambda architecture
 ```
 
-The build workflow checks out `ref`, builds it twice, and uploads the ZIPs, `SHA256SUMS`, and `manifest.json` as the `release-assets` artifact, with the files at its top level. It checks out `lambda_build.py` from its own commit, so the SHA you pin decides both. Release Planner's release workflow calls `build-release.yml` with read-only access, and this workflow keeps it that way.
+The build workflow checks out `ref` and runs each stage as its own step: build the functions twice in the pinned container, package each build into reproducible ZIPs and require them to match, check the release files, and upload the ZIPs, `SHA256SUMS`, and `manifest.json` as the `release-assets` artifact, with the files at its top level. It checks out `lambda_build.py` from its own commit, so the SHA you pin decides both. Release Planner's release workflow calls `build-release.yml` with read-only access, and this workflow keeps it that way.
 
 Release Planner attests every release asset, and GitHub offers artifact attestations only to public repositories, or to private ones on GitHub Enterprise Cloud.
 
@@ -111,11 +111,18 @@ python3 lambda_build.py check --release-dir release --commit "$SOURCE_COMMIT"
 
 ## Build or verify on your machine
 
-You need Python 3.11 or later, Git, and, to build or verify, Docker. From a clone of the application repository:
+You need Python 3.11 or later, Git, and, to build, package, or verify, Docker. From a clone of the application repository:
 
 ```sh
 # Build HEAD twice and write its release files.
 python3 lambda_build.py package --output build/release-assets
+
+# Or the same in two steps, as the build workflow runs them: build twice, then package both
+# builds. --builds needs the same --commit and --config that build used.
+commit=$(git rev-parse HEAD)
+python3 lambda_build.py build --commit "$commit" --config lambda-build.toml --output build/builds
+python3 lambda_build.py package --builds build/builds --commit "$commit" --config lambda-build.toml \
+  --output build/release-assets-from-builds
 
 # Rebuild a published release from its source commit and compare.
 python3 lambda_build.py verify --repository OWNER/NAME --tag v1.2.3

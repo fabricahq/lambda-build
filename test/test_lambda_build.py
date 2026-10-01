@@ -187,7 +187,7 @@ class PackagingTests(unittest.TestCase):
 
 
 class StagingTests(unittest.TestCase):
-    def test_a_failed_second_build_leaves_no_release_files(self):
+    def test_a_failed_second_build_leaves_no_release_files_or_builds(self):
         with tempfile.TemporaryDirectory() as temporary:
             repo, output = Path(temporary) / "repo", Path(temporary) / "release"
             repo.mkdir()
@@ -201,19 +201,24 @@ class StagingTests(unittest.TestCase):
 
             calls = []
 
-            def build(repo, commit, config, destination):
-                calls.append(destination)
+            def build_tree(repo, commit, config, root):
+                calls.append(root)
                 if len(calls) == 2:
                     raise lambda_build.ReleaseError("second build failed")
-                destination.mkdir()
-                (destination / "api.zip").write_text("first")
+                (root / "build/api").mkdir(parents=True)
+                (root / "build/api/index.mjs").write_text("first")
 
-            with mock.patch.object(lambda_build, "build", build):
+            with mock.patch.object(lambda_build, "build_tree", build_tree):
                 with self.assertRaisesRegex(lambda_build.ReleaseError, "second build failed"):
                     lambda_build.package_commit(repo, "HEAD", "lambda-build.toml", output)
+                builds = Path(temporary) / "builds"
+                calls.clear()
+                with self.assertRaisesRegex(lambda_build.ReleaseError, "second build failed"):
+                    lambda_build.build_twice(repo, "HEAD", "lambda-build.toml", builds)
             self.assertEqual(len(calls), 2)
             self.assertFalse(output.exists())
-            self.assertEqual(list(output.parent.glob(".release-*")), [])
+            self.assertFalse(builds.exists(), "a failed build must not leave a builds directory")
+            self.assertEqual(list(output.parent.glob(".release-*")) + list(output.parent.glob(".builds-*")), [])
 
 
 class ExportTests(unittest.TestCase):
@@ -612,6 +617,97 @@ class HostileReleaseTests(unittest.TestCase):
         self.assert_check_blocks(commit, "is a symlink", release=link)
 
 
+class BuildRecordTests(unittest.TestCase):
+    """package --builds trusts only its --commit and --config, and refuses builds recorded for anything else."""
+
+    SETTINGS = {"image": BUSYBOX, "build": "true", "runtime": "nodejs24.x", "architecture": "arm64",
+                "assets": [{"name": "api", "directory": "build/api"}]}
+    OTHER = {**SETTINGS, "assets": [{"name": "other", "directory": "build/other"}]}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q")
+        self.first = self.commit({"lambda-build.toml": toml(self.SETTINGS), "other.toml": toml(self.OTHER)})
+        self.second = self.commit({"lambda-build.toml": toml(self.OTHER)})
+        # Two identical build trees, as lambda_build.py build would leave them for the first commit.
+        self.builds = self.root / "builds"
+        for tree in ("first", "second"):
+            for name in ("api", "other"):
+                (self.builds / tree / "build" / name).mkdir(parents=True)
+                (self.builds / tree / "build" / name / "index.mjs").write_text(name)
+        self.record(source_commit=self.first, config="lambda-build.toml",
+                    config_blob=self.git("rev-parse", f"{self.first}:lambda-build.toml"))
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.com",
+                               *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(self, files):
+        for name, text in files.items():
+            (self.repo / name).write_text(text)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "change")
+        return self.git("rev-parse", "HEAD")
+
+    def record(self, **fields):
+        (self.builds / "build.json").write_text(json.dumps(fields))
+
+    def package(self, *args, output="release"):
+        return subprocess.run([sys.executable, str(SCRIPT), "package", "--builds", str(self.builds), *args,
+                               "--repo", str(self.repo), "--output", str(self.root / output)],
+                              text=True, capture_output=True)
+
+    def assert_refused(self, result, message):
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn(message, result.stderr)
+        self.assertFalse((self.root / "release").exists())
+
+    def test_packages_builds_recorded_for_the_trusted_commit_and_config(self):
+        result = self.package("--commit", self.first, "--config", "lambda-build.toml")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads((self.root / "release/manifest.json").read_text())["source_commit"], self.first)
+
+    def test_requires_the_trusted_commit_and_config(self):
+        self.assert_refused(self.package("--config", "lambda-build.toml"), "--builds needs --commit and --config")
+        self.assert_refused(self.package("--commit", self.first), "--builds needs --commit and --config")
+
+    def test_refuses_a_record_relabeled_with_another_commit(self):
+        # Outputs built from the first commit, relabeled as the second.
+        self.record(source_commit=self.second, config="lambda-build.toml",
+                    config_blob=self.git("rev-parse", f"{self.second}:lambda-build.toml"))
+        self.assert_refused(self.package("--commit", self.first, "--config", "lambda-build.toml"),
+                            "build.json records commit")
+
+    def test_refuses_a_record_pointing_at_another_config(self):
+        self.record(source_commit=self.first, config="other.toml",
+                    config_blob=self.git("rev-parse", f"{self.first}:other.toml"))
+        self.assert_refused(self.package("--commit", self.first, "--config", "lambda-build.toml"),
+                            "build.json records config other.toml")
+
+    def test_refuses_a_different_config_under_the_same_path(self):
+        self.record(source_commit=self.first, config="lambda-build.toml",
+                    config_blob=self.git("rev-parse", f"{self.first}:other.toml"))
+        self.assert_refused(self.package("--commit", self.first, "--config", "lambda-build.toml"),
+                            "was built with different lambda-build.toml contents")
+
+    def test_rejects_empty_commit_and_config_values(self):
+        for command in (["package", "--output", str(self.root / "out")], ["build", "--output", str(self.root / "out")],
+                        ["check", "--release-dir", str(self.root)], ["verify", "--release-dir", str(self.root)]):
+            for flag in ("--commit", "--config"):
+                if command[0] == "verify" and flag == "--commit":
+                    continue
+                extra = ["--commit", self.first] if command[0] == "check" and flag == "--config" else []
+                with self.subTest(command=command[0], flag=flag):
+                    result = subprocess.run([sys.executable, str(SCRIPT), *command, *extra, flag, "",
+                                             "--repo", str(self.repo)], text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("must not be empty", result.stderr)
+
+
 class CaseCollisionTests(unittest.TestCase):
     """Committed paths that differ only in case would overwrite each other on macOS and Windows."""
 
@@ -834,6 +930,34 @@ class ContainerTests(unittest.TestCase):
             tracemalloc.stop()
         self.assertEqual(changed, ["api.zip"])
         self.assertLess(peak, 16 * 1024 * 1024)
+
+    def test_builds_and_packages_as_separate_steps(self):
+        commit = self.commit("mkdir -p build/api && cp src/index.mjs build/api/")
+        builds = self.root / "builds"
+        built = self.cli("build", "--output", str(builds))
+        self.assertEqual(built.returncode, 0, built.stderr)
+        self.assertEqual(built.stderr.count("$ mkdir -p build/api"), 2)
+        self.assertEqual(sorted(p.name for p in builds.iterdir()), ["build.json", "first", "second"])
+        self.assertTrue((builds / "first/build/api/index.mjs").is_file())
+        config_blob = self.git("rev-parse", f"{commit}:lambda-build.toml")
+        self.assertEqual(json.loads((builds / "build.json").read_text()),
+                         {"source_commit": commit, "config": "lambda-build.toml", "config_blob": config_blob})
+
+        trusted = ["--commit", commit, "--config", "lambda-build.toml"]
+        packaged = self.cli("package", "--builds", str(builds), *trusted, "--output", str(self.root / "split"))
+        self.assertEqual(packaged.returncode, 0, packaged.stderr)
+        self.assertEqual(packaged.stdout, f"{FIXTURE_SHA256}  api.zip\n")
+        self.assertNotIn("$ mkdir", packaged.stderr, "packaging two builds must not build again")
+        whole = self.cli("package", "--output", str(self.root / "whole"))
+        self.assertEqual(whole.returncode, 0, whole.stderr)
+        self.assertEqual(lambda_build.differences(self.root / "split", self.root / "whole"), [])
+
+        # Packaging still requires the two builds to produce identical files.
+        (builds / "second/build/api/index.mjs").write_text("changed")
+        differ = self.cli("package", "--builds", str(builds), *trusted, "--output", str(self.root / "differ"))
+        self.assertEqual(differ.returncode, 1)
+        self.assertIn("produced different", differ.stderr)
+        self.assertFalse((self.root / "differ").exists())
 
     def test_rejects_irreproducible_and_failing_builds(self):
         self.commit("mkdir -p build/api && echo $RANDOM$RANDOM > build/api/index.mjs")
