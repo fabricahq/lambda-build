@@ -53,18 +53,27 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .lambda-build-tool
           persist-credentials: false
+      # Every step takes the commit and config from this workflow's inputs; package refuses builds
+      # whose build.json records anything else.
       - name: Build the functions (twice, in the pinned container)
         env:
           CONFIG: ${{ inputs.config }}
           REF: ${{ inputs.ref }}
-        run: python3 .lambda-build-tool/lambda_build.py build --commit "$REF" --config "$CONFIG" --output "$RUNNER_TEMP/builds"
+          BUILDS: ${{ runner.temp }}/builds
+        run: python3 .lambda-build-tool/lambda_build.py build --commit "$REF" --config "$CONFIG" --output "$BUILDS"
       - name: Package each function into a reproducible ZIP
-        run: python3 .lambda-build-tool/lambda_build.py package --builds "$RUNNER_TEMP/builds" --output "$RUNNER_TEMP/release-assets"
+        env:
+          CONFIG: ${{ inputs.config }}
+          REF: ${{ inputs.ref }}
+          BUILDS: ${{ runner.temp }}/builds
+          RELEASE_ASSETS: ${{ runner.temp }}/release-assets
+        run: python3 .lambda-build-tool/lambda_build.py package --builds "$BUILDS" --commit "$REF" --config "$CONFIG" --output "$RELEASE_ASSETS"
       - name: Check the release files
         env:
           CONFIG: ${{ inputs.config }}
           REF: ${{ inputs.ref }}
-        run: python3 .lambda-build-tool/lambda_build.py check --release-dir "$RUNNER_TEMP/release-assets" --commit "$REF" --config "$CONFIG"
+          RELEASE_ASSETS: ${{ runner.temp }}/release-assets
+        run: python3 .lambda-build-tool/lambda_build.py check --release-dir "$RELEASE_ASSETS" --commit "$REF" --config "$CONFIG"
       # Release Planner requires one artifact named release-assets with the files at its top level.
       - name: Upload release-assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

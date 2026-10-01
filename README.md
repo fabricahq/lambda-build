@@ -117,9 +117,12 @@ You need Python 3.11 or later, Git, and, to build, package, or verify, Docker. F
 # Build HEAD twice and write its release files.
 python3 lambda_build.py package --output build/release-assets
 
-# The same in two steps, as the build workflow runs them: build twice, then package both builds.
-python3 lambda_build.py build --output build/builds
-python3 lambda_build.py package --builds build/builds --output build/release-assets
+# Or the same in two steps, as the build workflow runs them: build twice, then package both
+# builds. --builds needs the same --commit and --config that build used.
+commit=$(git rev-parse HEAD)
+python3 lambda_build.py build --commit "$commit" --config lambda-build.toml --output build/builds
+python3 lambda_build.py package --builds build/builds --commit "$commit" --config lambda-build.toml \
+  --output build/release-assets-from-builds
 
 # Rebuild a published release from its source commit and compare.
 python3 lambda_build.py verify --repository OWNER/NAME --tag v1.2.3
