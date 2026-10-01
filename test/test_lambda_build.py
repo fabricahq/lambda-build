@@ -129,6 +129,18 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(lambda_build.ReleaseError, "full, lowercase Git commit SHA"):
             lambda_build.package(self.root, config(), "main", self.root / "release")
 
+    def test_rejects_asset_names_that_differ_only_in_case(self):
+        # On a case-insensitive filesystem API.zip and api.zip are one file, so one ZIP would
+        # silently replace the other while the manifest lists both.
+        self.files({"build/upper/index.mjs": b"upper", "build/lower/index.mjs": b"lower"})
+        self.assert_rejected("differ only in case", config(assets=[{"name": "API", "directory": "build/upper"},
+                                                                   {"name": "api", "directory": "build/lower"}]))
+        # A second safeguard: an existing ZIP is never overwritten.
+        (self.root / "taken.zip").write_bytes(b"first")
+        with self.assertRaises(FileExistsError):
+            lambda_build.write_zip([("index.mjs", b"second", False)], self.root / "taken.zip")
+        self.assertEqual((self.root / "taken.zip").read_bytes(), b"first")
+
     def test_rejects_asset_directories_reached_through_symlinks(self):
         outside = self.root / "outside/api"
         outside.mkdir(parents=True)

@@ -140,14 +140,20 @@ def resolve_assets(root, config):
     resolved = {name: (directory, expected) for name, directory, expected in specs}
     if len(resolved) != len(specs):
         raise ReleaseError("Each asset name may appear only once")
+    # A case-insensitive filesystem would store both ZIPs as one file.
+    if len({name.casefold() for name in resolved}) != len(resolved):
+        raise ReleaseError(f"Asset names {sorted(resolved)} must not differ only in case")
     if not resolved:
         raise ReleaseError(f"{config['assets_from']}: no function directories to package")
     return resolved
 
 
 def write_zip(entries, archive):
-    """Write (path, bytes, executable) entries as stored entries with fixed metadata, in the given order."""
-    with ZipFile(archive, "w", compression=ZIP_STORED, allowZip64=False) as bundle:
+    """Write (path, bytes, executable) entries as stored entries with fixed metadata, in the given order.
+
+    Creates `archive` exclusively, so an existing file is never overwritten.
+    """
+    with ZipFile(archive, "x", compression=ZIP_STORED, allowZip64=False) as bundle:
         for relative, data, executable in entries:
             entry = ZipInfo(relative, TIMESTAMP)
             entry.create_system = 3  # Unix, so the permission bits below are honored.
