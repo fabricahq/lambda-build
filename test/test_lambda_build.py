@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tracemalloc
 import unittest
 from unittest import mock
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
@@ -439,7 +440,7 @@ class HostileReleaseTests(unittest.TestCase):
     def test_rejects_duplicate_noncanonical_and_conflicting_paths(self):
         commit = self.commit_config({**self.NODE, "assets": [{"name": "api", "directory": "build/api"}]})
         cases = {"duplicate": ([("index.mjs", b"one"), ("index.mjs", b"two")], "duplicate path index.mjs"),
-                 "dot segment": ([("./index.mjs", b"x")], "noncanonical path ./index.mjs"),
+                 "dot segment": ([("./index.mjs", b"x")], "'./index.mjs' is not a canonical relative path"),
                  "file and directory": ([("a", b"x"), ("a/b", b"y")], "a is both a file and a directory")}
         for label, (entries, message) in cases.items():
             with self.subTest(label):
@@ -476,7 +477,15 @@ class HostileReleaseTests(unittest.TestCase):
                                                                 "files": ["index.mjs"]},
                                                                {"name": "web", "directory": "build/api",
                                                                 "files": ["other.mjs"]}]},
-                                                   "asset sources overlap")}
+                                                   "asset sources overlap"),
+                   # No build could create these directories, so no release can come from them.
+                   "a NUL in a directory": ({"assets": [{"name": "api", "directory": "build/a\0b"}]},
+                                            "contains a NUL"),
+                   "a 256-byte name in assets_from": ({"assets_from": "build/" + "a" * 256},
+                                                      "a name longer than 255 bytes"),
+                   "a directory longer than 1024 bytes": ({"assets": [{"name": "api",
+                                                                       "directory": "/".join(["a" * 200] * 6)}]},
+                                                          "longer than 1024 bytes")}
         for label, (settings, message) in invalid.items():
             commit = self.commit_config({**self.NODE, **settings})
             for command in ("check", "package"):
@@ -568,10 +577,27 @@ class PathLimitTests(unittest.TestCase):
         self.assert_paths([at_limit])
         self.assert_paths([at_limit + "c"], "longer than 1024 bytes")
 
+    def test_memory_stays_bounded_for_many_deep_paths(self):
+        # A tree of directory prefixes once peaked at about 91 MiB for these 1000 empty files.
+        files = [f"{index:05d}/" + "a/" * 500 + "f" for index in range(1000)]
+        tracemalloc.start()
+        try:
+            lambda_build.check_paths("api", files)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 8 * 1024 * 1024)
+
+    def test_rejects_nul_in_paths(self):
+        self.assert_paths(["a\0b"], "contains a NUL")
+
     def test_rejects_files_that_are_also_directories_in_either_order(self):
         self.assert_paths(["a", "a/b"], "a is both a file and a directory")
         self.assert_paths(["a/b/c", "a/b"], "a/b is both a file and a directory")
         self.assert_paths(["a/b", "a/c", "d"])
+        # "a!" sorts between "a" and "a/b" as a string, but not by path components.
+        self.assert_paths(["a/b", "a!", "a"], "a is both a file and a directory")
+        self.assert_paths(["a!", "a/b", "a", "a"], "duplicate path a")
 
 
 class ConfigTests(unittest.TestCase):

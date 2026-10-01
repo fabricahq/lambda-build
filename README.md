@@ -43,7 +43,7 @@ executable = ["bootstrap"]
 # files = ["index.mjs"]
 ```
 
-Unknown settings are errors, and asset sources must not overlap: no asset directory, or `assets_from`, may be the same as or inside another. The build starts from the committed tree only: no `.git`, untracked files, dependencies installed on the host, or credentials. It must install its own dependencies from a lockfile. It runs as your user ID with `HOME=/tmp/home`.
+Unknown settings are errors, and asset sources must not overlap: no asset directory, or `assets_from`, may be the same as or inside another. Those paths follow the same limits as paths inside a ZIP. The build starts from the committed tree only: no `.git`, untracked files, dependencies installed on the host, or credentials. It must install its own dependencies from a lockfile. It runs as your user ID with `HOME=/tmp/home`.
 
 ## Build release assets with Release Planner
 

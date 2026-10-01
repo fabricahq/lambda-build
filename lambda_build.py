@@ -115,10 +115,14 @@ def parse_config(text):
 
 
 def inside_repository(value, setting):
-    """Return a config path as a relative path, rejecting absolute paths and `..` escapes."""
+    """Return a config path as a relative path, rejecting absolute paths, `..` escapes, and any
+    path a Linux filesystem could not hold, which no build could produce."""
     path = PurePosixPath(value)
     if path.is_absolute() or ".." in path.parts:
         raise ReleaseError(f"{CONFIG}: {setting} {value!r} must be a path inside the repository")
+    problem = path_problem("/".join(path.parts)) if path.parts else None
+    if problem:
+        raise ReleaseError(f"{CONFIG}: {setting} {value[:60]!r} {problem}")
     return path
 
 
@@ -205,36 +209,40 @@ def write_zip(entries, archive):
             bundle.writestr(entry, data)
 
 
+def path_problem(path):
+    """Return why `path` cannot be a relative path on a Linux filesystem, or None if it can."""
+    if "\0" in path:
+        return "contains a NUL"
+    if len(path.encode()) > MAX_PATH_BYTES:
+        return f"is longer than {MAX_PATH_BYTES} bytes"
+    parts = path.split("/")
+    if path.startswith("/") or any(part in ("", ".", "..") for part in parts):
+        return "is not a canonical relative path"
+    if any(len(part.encode()) > MAX_NAME_BYTES for part in parts):
+        return f"has a name longer than {MAX_NAME_BYTES} bytes"
+    return None
+
+
 def check_paths(name, files):
     """Fail unless `files` could be a real directory tree on a Linux filesystem: nonempty, unique,
     canonically spelled, within the name and path length limits, and with no path that is both a
-    file and another path's directory. Runs in time linear in the total length of the paths."""
+    file and another path's directory. Uses memory proportional to the paths themselves."""
     if not files:
         raise ReleaseError(f"{name}: no files to package")
     if len(files) > MAX_FILES:
         raise ReleaseError(f"{name}: more than {MAX_FILES} files, the most a ZIP without Zip64 holds")
-    # Lengths first, so later work is bounded however deep a crafted path is.
     for path in files:
-        if len(path.encode()) > MAX_PATH_BYTES:
-            raise ReleaseError(f"{name}: path {path[:60]}... is longer than {MAX_PATH_BYTES} bytes")
-    tree = {}  # directory name -> subtree; a file's name maps to None
-    for path in files:
-        parts = path.split("/")
-        if path.startswith("/") or any(part in ("", ".", "..") for part in parts):
-            raise ReleaseError(f"{name}: noncanonical path {path}")
-        for part in parts:
-            if len(part.encode()) > MAX_NAME_BYTES:
-                raise ReleaseError(f"{name}: {path}: a name is longer than {MAX_NAME_BYTES} bytes")
-        node = tree
-        for depth, part in enumerate(parts[:-1], start=1):
-            node = node.setdefault(part, {})
-            if node is None:
-                raise ReleaseError(f"{name}: {'/'.join(parts[:depth])} is both a file and a directory")
-        if parts[-1] in node:
-            if node[parts[-1]] is None:
-                raise ReleaseError(f"{name}: duplicate path {path}")
-            raise ReleaseError(f"{name}: {path} is both a file and a directory")
-        node[parts[-1]] = None
+        problem = path_problem(path)
+        if problem:
+            raise ReleaseError(f"{name}: path {path[:60]!r} {problem}")
+    # Sorting with "/" as the lowest character orders paths by their components, so a duplicate is
+    # next to its twin and a file is directly followed by any path inside it.
+    ordered = sorted(files, key=lambda path: path.replace("/", "\0"))
+    for current, following in zip(ordered, ordered[1:]):
+        if following == current:
+            raise ReleaseError(f"{name}: duplicate path {current}")
+        if following.startswith(current + "/"):
+            raise ReleaseError(f"{name}: {current} is both a file and a directory")
 
 
 def check_asset(name, files, unpacked_size, expected, config):
