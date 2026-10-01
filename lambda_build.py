@@ -32,6 +32,10 @@ MAX_ZIP_BYTES = 50 * 1024 * 1024
 MAX_UNPACKED_BYTES = 250 * 1024 * 1024
 # The canonical writer uses no Zip64 extensions, which caps a ZIP at 65535 entries.
 MAX_FILES = 65535
+# Paths a Linux filesystem accepts: 255-byte names (NAME_MAX), and a cap on the whole path that
+# also bounds its depth.
+MAX_NAME_BYTES = 255
+MAX_PATH_BYTES = 1024
 TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 FILE_MODE = 0o100644
 EXECUTABLE_MODE = 0o100755
@@ -96,10 +100,17 @@ def parse_config(text):
     for name in names:
         check_name(name)
     check_names(names, allow_empty=True)
-    for asset in assets:
-        inside_repository(asset["directory"], "asset directory")
+    sources = [(f"asset {asset['name']}", inside_repository(asset["directory"], "asset directory").parts)
+               for asset in assets]
     if "assets_from" in config:
-        inside_repository(config["assets_from"], "assets_from")
+        sources.append(("assets_from", inside_repository(config["assets_from"], "assets_from").parts))
+    # One directory, or one inside another, would package the same files as two assets.
+    for index, (label, parts) in enumerate(sources):
+        for other_label, other_parts in sources[index + 1:]:
+            shorter = min(len(parts), len(other_parts))
+            if parts[:shorter] == other_parts[:shorter]:
+                raise ReleaseError(f"{CONFIG}: asset sources overlap: {label} at {'/'.join(parts) or '.'} "
+                                   f"and {other_label} at {'/'.join(other_parts) or '.'}")
     return config
 
 
@@ -195,25 +206,35 @@ def write_zip(entries, archive):
 
 
 def check_paths(name, files):
-    """Fail unless `files` could be a real directory tree: nonempty, unique, canonically spelled,
-    and with no path that is both a file and another path's directory."""
+    """Fail unless `files` could be a real directory tree on a Linux filesystem: nonempty, unique,
+    canonically spelled, within the name and path length limits, and with no path that is both a
+    file and another path's directory. Runs in time linear in the total length of the paths."""
     if not files:
         raise ReleaseError(f"{name}: no files to package")
     if len(files) > MAX_FILES:
         raise ReleaseError(f"{name}: more than {MAX_FILES} files, the most a ZIP without Zip64 holds")
-    seen = set()
+    # Lengths first, so later work is bounded however deep a crafted path is.
     for path in files:
-        if path in seen:
-            raise ReleaseError(f"{name}: duplicate path {path}")
-        seen.add(path)
+        if len(path.encode()) > MAX_PATH_BYTES:
+            raise ReleaseError(f"{name}: path {path[:60]}... is longer than {MAX_PATH_BYTES} bytes")
+    tree = {}  # directory name -> subtree; a file's name maps to None
+    for path in files:
         parts = path.split("/")
-        if not path or path.startswith("/") or any(part in ("", ".", "..") for part in parts):
+        if path.startswith("/") or any(part in ("", ".", "..") for part in parts):
             raise ReleaseError(f"{name}: noncanonical path {path}")
-    for path in files:
-        parts = path.split("/")
-        for depth in range(1, len(parts)):
-            if "/".join(parts[:depth]) in seen:
+        for part in parts:
+            if len(part.encode()) > MAX_NAME_BYTES:
+                raise ReleaseError(f"{name}: {path}: a name is longer than {MAX_NAME_BYTES} bytes")
+        node = tree
+        for depth, part in enumerate(parts[:-1], start=1):
+            node = node.setdefault(part, {})
+            if node is None:
                 raise ReleaseError(f"{name}: {'/'.join(parts[:depth])} is both a file and a directory")
+        if parts[-1] in node:
+            if node[parts[-1]] is None:
+                raise ReleaseError(f"{name}: duplicate path {path}")
+            raise ReleaseError(f"{name}: {path} is both a file and a directory")
+        node[parts[-1]] = None
 
 
 def check_asset(name, files, unpacked_size, expected, config):

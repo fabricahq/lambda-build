@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
@@ -447,6 +448,14 @@ class HostileReleaseTests(unittest.TestCase):
                 self.write_release(commit, {"api": self.stored_zip(entries)})
                 self.assert_check_blocks(commit, message)
 
+    def test_rejects_a_deep_path_quickly(self):
+        # 32,000 directory levels in about 128 KiB once made the prefix check take seconds.
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        self.write_release(commit, {"api": self.stored_zip([("a/" * 32000 + "f", b"x")])})
+        started = time.monotonic()
+        self.assert_check_blocks(commit, "longer than 1024 bytes")
+        self.assertLess(time.monotonic() - started, 5)
+
     def test_rejects_empty_releases_and_empty_zips(self):
         commit = self.commit_config({**self.NODE, "assets_from": "build"})
         self.write_release(commit, {})
@@ -458,7 +467,16 @@ class HostileReleaseTests(unittest.TestCase):
         invalid = {"duplicate asset names": ({"assets": [{"name": "api", "directory": "build/a"},
                                                          {"name": "api", "directory": "build/b"}]}, "only once"),
                    "a directory outside the repository": ({"assets": [{"name": "api", "directory": "../outside"}]},
-                                                          "must be a path inside the repository")}
+                                                          "must be a path inside the repository"),
+                   # assets_from would also package build/api as api, so package saw two assets named api.
+                   "an asset inside assets_from": ({"assets_from": "build",
+                                                    "assets": [{"name": "api", "directory": "build/api"}]},
+                                                   "asset sources overlap"),
+                   "two assets on one directory": ({"assets": [{"name": "api", "directory": "build/api",
+                                                                "files": ["index.mjs"]},
+                                                               {"name": "web", "directory": "build/api",
+                                                                "files": ["other.mjs"]}]},
+                                                   "asset sources overlap")}
         for label, (settings, message) in invalid.items():
             commit = self.commit_config({**self.NODE, **settings})
             for command in ("check", "package"):
@@ -526,6 +544,34 @@ class CaseCollisionTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 lambda_build.export(repo, commit, destination)
             self.assertEqual((destination / "a.txt").read_bytes(), b"already here")
+
+
+class PathLimitTests(unittest.TestCase):
+    """package and check share filesystem limits on ZIP paths, tested at each limit and one past it."""
+
+    def assert_paths(self, files, message=None):
+        if message is None:
+            lambda_build.check_paths("api", files)
+        else:
+            with self.assertRaisesRegex(lambda_build.ReleaseError, message):
+                lambda_build.check_paths("api", files)
+
+    def test_limits_each_component_to_255_bytes(self):
+        self.assert_paths(["a" * 255])
+        self.assert_paths(["dir/" + "é" * 127 + "a"])  # 255 bytes in UTF-8
+        self.assert_paths(["a" * 256], "longer than 255 bytes")
+        self.assert_paths(["dir/" + "é" * 128], "longer than 255 bytes")
+
+    def test_limits_each_path_to_1024_bytes(self):
+        at_limit = "/".join(["a" * 200] * 5) + "/" + "b" * 19  # 1024 bytes
+        self.assertEqual(len(at_limit.encode()), 1024)
+        self.assert_paths([at_limit])
+        self.assert_paths([at_limit + "c"], "longer than 1024 bytes")
+
+    def test_rejects_files_that_are_also_directories_in_either_order(self):
+        self.assert_paths(["a", "a/b"], "a is both a file and a directory")
+        self.assert_paths(["a/b/c", "a/b"], "a/b is both a file and a directory")
+        self.assert_paths(["a/b", "a/c", "d"])
 
 
 class ConfigTests(unittest.TestCase):

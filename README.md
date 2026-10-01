@@ -8,7 +8,7 @@ This repository is built for Fabrica's own repositories and conventions. It is p
 
 - **Builds in a pinned container.** The build command runs twice, each time in a clean export of the commit, inside a container image pinned by digest, on the Lambda's own Linux platform. A deterministic build command then produces the same bytes on a CI runner or a laptop. Commands that depend on the time, unpinned downloads, or the host still differ, and the two-build comparison is meant to catch them.
 - **Packages byte-reproducible ZIPs.** Entries are stored uncompressed, sorted by path, dated 1980-01-01, with 0644 permissions, or 0755 for files you mark executable. Packaging fails unless both builds produce identical ZIPs.
-- **Enforces Lambda's direct-upload limits**: 50 MiB per ZIP and 250 MiB unzipped. It also requires an executable `bootstrap` for OS-only runtimes such as `provided.al2023`.
+- **Enforces Lambda's direct-upload limits**: 50 MiB per ZIP and 250 MiB unzipped. It also requires an executable `bootstrap` for OS-only runtimes such as `provided.al2023`, and keeps every path a Linux filesystem accepts: names of at most 255 bytes and paths of at most 1024 bytes.
 - **Builds with read-only access.** The reusable build workflow owns its job with `contents: read` and refuses `pull_request_target`.
 - **Verifies a published release.** `verify` rebuilds a release from its source commit and compares every published file, the ZIPs included, with the rebuild.
 
@@ -43,7 +43,7 @@ executable = ["bootstrap"]
 # files = ["index.mjs"]
 ```
 
-Unknown settings are errors. The build starts from the committed tree only: no `.git`, untracked files, dependencies installed on the host, or credentials. It must install its own dependencies from a lockfile. It runs as your user ID with `HOME=/tmp/home`.
+Unknown settings are errors, and asset sources must not overlap: no asset directory, or `assets_from`, may be the same as or inside another. The build starts from the committed tree only: no `.git`, untracked files, dependencies installed on the host, or credentials. It must install its own dependencies from a lockfile. It runs as your user ID with `HOME=/tmp/home`.
 
 ## Build release assets with Release Planner
 
