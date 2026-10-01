@@ -1,7 +1,8 @@
 name: Build Lambda release assets
 # Reusable build job: checks out one commit, builds it twice in the container image pinned by
-# its lambda-build.toml, requires identical files, and uploads the ZIPs, SHA256SUMS, and
-# manifest.json as the release-assets artifact that Release Planner attests and publishes.
+# its lambda-build.toml, packages each build and requires identical files, checks them, and
+# uploads the ZIPs, SHA256SUMS, and manifest.json as the release-assets artifact that Release
+# Planner attests and publishes. Each stage is its own step, so a failure shows where it happened.
 # It owns the job so the job can only read the repository, whatever the caller grants, and it
 # never tags or publishes.
 on:
@@ -22,6 +23,7 @@ on:
 permissions: {}
 jobs:
   build:
+    name: Build and package
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 30
     permissions:
@@ -51,13 +53,21 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .lambda-build-tool
           persist-credentials: false
-      - name: Build twice in the pinned container and package
+      - name: Build the functions (twice, in the pinned container)
         env:
           CONFIG: ${{ inputs.config }}
           REF: ${{ inputs.ref }}
-        run: python3 .lambda-build-tool/lambda_build.py package --commit "$REF" --config "$CONFIG" --output "$RUNNER_TEMP/release-assets"
+        run: python3 .lambda-build-tool/lambda_build.py build --commit "$REF" --config "$CONFIG" --output "$RUNNER_TEMP/builds"
+      - name: Package each function into a reproducible ZIP
+        run: python3 .lambda-build-tool/lambda_build.py package --builds "$RUNNER_TEMP/builds" --output "$RUNNER_TEMP/release-assets"
+      - name: Check the release files
+        env:
+          CONFIG: ${{ inputs.config }}
+          REF: ${{ inputs.ref }}
+        run: python3 .lambda-build-tool/lambda_build.py check --release-dir "$RUNNER_TEMP/release-assets" --commit "$REF" --config "$CONFIG"
       # Release Planner requires one artifact named release-assets with the files at its top level.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - name: Upload release-assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-assets
           path: ${{ runner.temp }}/release-assets
