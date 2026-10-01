@@ -667,12 +667,17 @@ def verify(repo, release, config_path):
             raise ReleaseError(f"{release}: manifest.json is larger than {MAX_MANIFEST_BYTES} bytes, "
                                "more than any lambda-build manifest")
         with open(path, "rb") as file:
-            manifest = json.loads(file.read(MAX_MANIFEST_BYTES + 1)[:MAX_MANIFEST_BYTES])
-        commit = manifest["source_commit"]
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        raise ReleaseError(f"{release}: unreadable manifest.json ({error})") from None
-    if manifest.get("format_version") != FORMAT_VERSION or not isinstance(commit, str) or not COMMIT.fullmatch(commit):
-        raise ReleaseError(f"{release}: manifest.json is not a format {FORMAT_VERSION} Lambda release manifest")
+            text = file.read(MAX_MANIFEST_BYTES + 1)[:MAX_MANIFEST_BYTES]
+    except OSError as error:
+        raise ReleaseError(f"{release}: unreadable manifest.json ({error.strerror})") from None
+    try:
+        manifest = json.loads(text)
+    except (ValueError, RecursionError) as error:  # deep nesting overflows json's recursive decoder
+        raise ReleaseError(f"{release}: manifest.json is not a lambda-build manifest ({type(error).__name__})") from None
+    commit = manifest.get("source_commit") if isinstance(manifest, dict) else None
+    if (not isinstance(manifest, dict) or manifest.get("format_version") != FORMAT_VERSION
+            or not isinstance(commit, str) or not COMMIT.fullmatch(commit)):
+        raise ReleaseError(f"{release}: manifest.json is not a lambda-build manifest of format {FORMAT_VERSION}")
     try:
         resolve_commit(repo, commit)
     except ReleaseError:

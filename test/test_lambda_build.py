@@ -540,6 +540,17 @@ class HostileReleaseTests(unittest.TestCase):
             tracemalloc.stop()
         self.assertLess(peak, 2 * 1024 * 1024)
 
+    def test_verify_reports_a_deeply_nested_manifest_cleanly(self):
+        # Deep nesting once raised an uncaught RecursionError inside json; the depth that does so varies by Python version.
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        self.write_release(commit, {"api": self.stored_zip([("index.mjs", b"x")])})
+        (self.release / "manifest.json").write_text("[" * 400000 + "]" * 400000)  # 800 KB, under the 1 MiB cap
+        result = subprocess.run([sys.executable, str(SCRIPT), "verify", "--release-dir", str(self.release),
+                                 "--repo", str(self.repo)], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("is not a lambda-build manifest", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_refuses_archives_that_are_not_one_plain_central_directory(self):
         commit = self.commit_config({**self.NODE, "assets_from": "build"})
         valid = self.stored_zip([("index.mjs", b"x")])
@@ -873,7 +884,7 @@ class ContainerTests(unittest.TestCase):
         (release / "manifest.json").write_text(json.dumps({"format_version": 2, "source_commit": "b" * 40}))
         result = self.cli("verify", "--release-dir", str(release))
         self.assertEqual(result.returncode, 1)
-        self.assertIn("is not a format 3 Lambda release manifest", result.stderr)
+        self.assertIn("is not a lambda-build manifest of format 3", result.stderr)
 
 
 if __name__ == "__main__":
