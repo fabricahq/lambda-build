@@ -18,17 +18,20 @@ import os
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 import sys
 import tempfile
 import tomllib
-from zipfile import ZIP_STORED, BadZipFile, ZipFile, ZipInfo
+from zipfile import ZIP_STORED, ZipFile, ZipInfo
 
 # Format 3 records runtime and architecture on each asset; format 2 recorded them once per release.
 FORMAT_VERSION = 3
 # Lambda rejects direct uploads above these sizes. Stored entries make each ZIP slightly larger than its files.
 MAX_ZIP_BYTES = 50 * 1024 * 1024
 MAX_UNPACKED_BYTES = 250 * 1024 * 1024
+# The canonical writer uses no Zip64 extensions, which caps a ZIP at 65535 entries.
+MAX_FILES = 65535
 TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 FILE_MODE = 0o100644
 EXECUTABLE_MODE = 0o100755
@@ -86,15 +89,31 @@ def parse_config(text):
         raise ReleaseError(f"{CONFIG}: executable must be an array of ZIP paths")
     if not assets and "assets_from" not in config:
         raise ReleaseError(f"{CONFIG}: set assets or assets_from")
+    # Static rules every command shares, so package and check accept exactly the same configs.
+    names = [asset["name"] for asset in assets]
+    if len(set(names)) != len(names):
+        raise ReleaseError(f"{CONFIG}: each asset name may appear only once")
+    for name in names:
+        check_name(name)
+    check_names(names, allow_empty=True)
+    for asset in assets:
+        inside_repository(asset["directory"], "asset directory")
+    if "assets_from" in config:
+        inside_repository(config["assets_from"], "assets_from")
     return config
 
 
-def relative_path(root, value, setting):
-    """Resolve a config path inside the source tree, rejecting absolute paths and `..` escapes."""
-    path = Path(value)
+def inside_repository(value, setting):
+    """Return a config path as a relative path, rejecting absolute paths and `..` escapes."""
+    path = PurePosixPath(value)
     if path.is_absolute() or ".." in path.parts:
         raise ReleaseError(f"{CONFIG}: {setting} {value!r} must be a path inside the repository")
-    return root / path
+    return path
+
+
+def relative_path(root, value, setting):
+    """Resolve a config path inside the source tree."""
+    return root.joinpath(*inside_repository(value, setting).parts)
 
 
 def contained(root, directory):
@@ -128,8 +147,17 @@ def collect(directory):
     return sorted(files)
 
 
-def check_names(names):
-    """Fail when asset names differ only in case: a case-insensitive filesystem stores both ZIPs as one file."""
+def check_name(name):
+    """Fail unless `name` is a valid asset name, which also makes NAME.zip a plain file name."""
+    if not NAME.fullmatch(name):
+        raise ReleaseError(f"Asset name {name!r} must start with a letter or digit and use only letters, digits, '.', '_', and '-'")
+
+
+def check_names(names, allow_empty=False):
+    """Fail on an empty asset set, or on names that differ only in case, which a case-insensitive
+    filesystem stores as one ZIP."""
+    if not names and not allow_empty:
+        raise ReleaseError("There are no assets to package")
     if len({name.casefold() for name in names}) != len(set(names)):
         raise ReleaseError(f"Asset names {sorted(names)} must not differ only in case")
 
@@ -150,8 +178,6 @@ def resolve_assets(root, config):
     if len(resolved) != len(specs):
         raise ReleaseError("Each asset name may appear only once")
     check_names(resolved)
-    if not resolved:
-        raise ReleaseError(f"{config['assets_from']}: no function directories to package")
     return resolved
 
 
@@ -168,10 +194,32 @@ def write_zip(entries, archive):
             bundle.writestr(entry, data)
 
 
+def check_paths(name, files):
+    """Fail unless `files` could be a real directory tree: nonempty, unique, canonically spelled,
+    and with no path that is both a file and another path's directory."""
+    if not files:
+        raise ReleaseError(f"{name}: no files to package")
+    if len(files) > MAX_FILES:
+        raise ReleaseError(f"{name}: more than {MAX_FILES} files, the most a ZIP without Zip64 holds")
+    seen = set()
+    for path in files:
+        if path in seen:
+            raise ReleaseError(f"{name}: duplicate path {path}")
+        seen.add(path)
+        parts = path.split("/")
+        if not path or path.startswith("/") or any(part in ("", ".", "..") for part in parts):
+            raise ReleaseError(f"{name}: noncanonical path {path}")
+    for path in files:
+        parts = path.split("/")
+        for depth in range(1, len(parts)):
+            if "/".join(parts[:depth]) in seen:
+                raise ReleaseError(f"{name}: {'/'.join(parts[:depth])} is both a file and a directory")
+
+
 def check_asset(name, files, unpacked_size, expected, config):
-    """Apply the per-asset rules shared by `package` and `check` to one asset's sorted file list."""
-    if not NAME.fullmatch(name):
-        raise ReleaseError(f"Asset name {name!r} must start with a letter or digit and use only letters, digits, '.', '_', and '-'")
+    """Apply the per-asset rules shared by `package` and `check` to one asset's file list."""
+    check_name(name)
+    check_paths(name, files)
     if expected is not None and set(files) != set(expected):
         missing, unexpected = sorted(set(expected) - set(files)), sorted(set(files) - set(expected))
         raise ReleaseError(f"{name}: must contain exactly the expected files; "
@@ -198,18 +246,18 @@ def zip_bytes(entries):
 
 
 def release_metadata(commit, config, archives):
-    """Return the SHA256SUMS text and manifest for (name, ZIP bytes) pairs sorted by name.
+    """Return the SHA256SUMS text and manifest for (name, sha256, size) triples sorted by name.
 
     `package` writes exactly these files and `check` requires them, byte for byte.
     """
     if not COMMIT.fullmatch(commit):
         raise ReleaseError("Source commit must be a full, lowercase Git commit SHA")
     entries = []
-    for name, data in archives:
-        if len(data) > MAX_ZIP_BYTES:
-            raise ReleaseError(f"{name}: {name}.zip exceeds Lambda's 50 MiB direct-upload limit")
-        entries.append({"name": name, "asset": f"{name}.zip", "sha256": hashlib.sha256(data).hexdigest(),
-                        "size": len(data), "runtime": config["runtime"], "architecture": config["architecture"]})
+    for name, digest, size in archives:
+        if size > MAX_ZIP_BYTES:
+            raise ReleaseError(f"{name}.zip exceeds Lambda's 50 MiB direct-upload limit")
+        entries.append({"name": name, "asset": f"{name}.zip", "sha256": digest,
+                        "size": size, "runtime": config["runtime"], "architecture": config["architecture"]})
     sums = "".join(f"{e['sha256']}  {e['asset']}\n" for e in entries)
     # Runtime and architecture describe each asset, so the format can hold assets built for
     # different runtimes without changing.
@@ -235,7 +283,8 @@ def package(root, config, commit, output):
     check_executables(config, [files for _, files in contents.values()])
     archives = [(name, zip_bytes([(f, (directory / f).read_bytes(), f in executables) for f in files]))
                 for name, (directory, files) in contents.items()]
-    sums, manifest, manifest_text = release_metadata(commit, config, archives)
+    sums, manifest, manifest_text = release_metadata(
+        commit, config, [(name, hashlib.sha256(data).hexdigest(), len(data)) for name, data in archives])
 
     output.parent.mkdir(parents=True, exist_ok=True)
     # Stage beside the output and move it into place last, so a failure never leaves partial assets.
@@ -253,57 +302,99 @@ def package(root, config, commit, output):
     return manifest
 
 
+def read_member(directory, name, limit, too_large):
+    """Read a regular file inside the open directory `directory` without following symlinks,
+    reading at most `limit` bytes and raising `too_large` beyond that."""
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    except OSError:
+        raise ReleaseError(f"{name} is not a regular file") from None
+    with os.fdopen(descriptor, "rb") as member:
+        if not stat.S_ISREG(os.fstat(member.fileno()).st_mode):
+            raise ReleaseError(f"{name} is not a regular file")
+        data = member.read(limit + 1)
+    if len(data) > limit:
+        raise ReleaseError(too_large)
+    return data
+
+
+def read_zip_entries(name, data, expected, config):
+    """Return the (path, bytes) entries of an untrusted ZIP after the checks that need no file contents.
+
+    Rejects anything but stored entries and applies the shared asset rules before reading entry
+    data, so no entry is decompressed and memory stays within the archive's own size.
+    """
+    try:
+        with ZipFile(BytesIO(data)) as bundle:
+            infos = bundle.infolist()
+            check_paths(name, [info.filename for info in infos[:MAX_FILES + 1]])
+            for info in infos:
+                if info.compress_type != ZIP_STORED or info.compress_size != info.file_size:
+                    raise ReleaseError(f"{name}.zip: entry {info.filename} is not stored")
+            check_asset(name, [info.filename for info in infos], sum(info.file_size for info in infos), expected, config)
+            return [(info.filename, bundle.read(info)) for info in infos]
+    except ReleaseError:
+        raise
+    except Exception as error:  # zipfile raises many types for malformed input; all mean "not a release ZIP"
+        raise ReleaseError(f"{name}.zip is not a readable ZIP ({type(error).__name__}: {error})") from None
+
+
 def check_release(repo, release, revision, config_path):
     """Fail unless `release` holds exactly the files `package` writes for its ZIPs and the commit.
 
     Builds nothing and runs no code from the repository: it reads the config as committed,
     requires each ZIP to be canonical and to follow the packaging rules, and recomputes
-    SHA256SUMS and manifest.json from the ZIPs, requiring them byte for byte. Returns the
-    SHA256SUMS text.
+    SHA256SUMS and manifest.json from the ZIPs, requiring them byte for byte. Every read is
+    bounded, files are opened relative to the directory without following symlinks, and one ZIP
+    is held in memory at a time. Returns the SHA256SUMS text.
     """
     commit = resolve_commit(repo, revision)
     config = read_config(repo, commit, config_path)
-    present = sorted(p.name for p in release.iterdir())
-    for name in present:
-        if (release / name).is_symlink() or not (release / name).is_file():
-            raise ReleaseError(f"{name} is not a regular file")
-    names = [name[:-len(".zip")] for name in present if name.endswith(".zip")]
-    check_names(names)
-    configured = {asset["name"]: asset.get("files") for asset in config["assets"]}
-    allowed = set(names) if "assets_from" in config else set(configured)
-    expected_files = sorted({f"{name}.zip" for name in allowed | set(configured)} | {"SHA256SUMS", "manifest.json"})
-    if present != expected_files:
-        missing, extra = sorted(set(expected_files) - set(present)), sorted(set(present) - set(expected_files))
-        raise ReleaseError(f"{release} must hold exactly lambda-build's files; "
-                           f"missing {missing or 'none'}, unexpected {extra or 'none'}")
-    archives, file_lists = [], []
-    executables = set(config["executable"])
-    for name in sorted(names):
-        data = (release / f"{name}.zip").read_bytes()
-        try:
-            with ZipFile(BytesIO(data)) as bundle:
-                infos = bundle.infolist()
-                entries = [(info.filename, bundle.read(info)) for info in infos]
-        except (BadZipFile, OSError, ValueError) as error:
-            raise ReleaseError(f"{name}.zip is not a readable ZIP ({error})") from None
-        files = [path for path, _ in entries]
-        for path in files:
-            parts = PurePosixPath(path).parts
-            if path.startswith("/") or path.endswith("/") or ".." in parts:
-                raise ReleaseError(f"{name}.zip: unsafe entry {path!r}")
-        check_asset(name, sorted(files), sum(len(content) for _, content in entries), configured.get(name), config)
-        canonical = zip_bytes([(path, content, path in executables) for path, content in sorted(entries)])
-        if canonical != data:
-            raise ReleaseError(f"{name}.zip is not the canonical ZIP lambda-build writes for its files "
-                               "(stored, sorted, fixed timestamps and permissions)")
-        archives.append((name, data))
-        file_lists.append(files)
-    check_executables(config, file_lists)
-    sums, _, manifest_text = release_metadata(commit, config, archives)
-    if (release / "SHA256SUMS").read_bytes() != sums.encode():
-        raise ReleaseError("SHA256SUMS does not match what lambda-build writes for these ZIPs")
-    if (release / "manifest.json").read_bytes() != manifest_text.encode():
-        raise ReleaseError(f"manifest.json does not match what lambda-build writes for these ZIPs and {commit}")
+    if release.is_symlink():
+        raise ReleaseError(f"{release} is a symlink; pass the release directory itself")
+    try:
+        directory = os.open(release, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise ReleaseError(f"{release} is not a directory ({error.strerror})") from None
+    try:
+        present = sorted(os.listdir(directory))
+        for name in present:
+            if not stat.S_ISREG(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mode):
+                raise ReleaseError(f"{name} is not a regular file")
+        names = [name[:-len(".zip")] for name in present if name.endswith(".zip")]
+        for name in names:
+            check_name(name)
+        check_names(names)
+        configured = {asset["name"]: asset.get("files") for asset in config["assets"]}
+        allowed = set(names) if "assets_from" in config else set(configured)
+        expected_files = sorted({f"{name}.zip" for name in allowed | set(configured)} | {"SHA256SUMS", "manifest.json"})
+        if present != expected_files:
+            missing, extra = sorted(set(expected_files) - set(present)), sorted(set(present) - set(expected_files))
+            raise ReleaseError(f"{release} must hold exactly lambda-build's files; "
+                               f"missing {missing or 'none'}, unexpected {extra or 'none'}")
+        archives, file_lists = [], []
+        executables = set(config["executable"])
+        for name in sorted(names):
+            data = read_member(directory, f"{name}.zip", MAX_ZIP_BYTES,
+                               f"{name}.zip exceeds Lambda's 50 MiB direct-upload limit")
+            entries = read_zip_entries(name, data, configured.get(name), config)
+            canonical = zip_bytes([(path, content, path in executables) for path, content in sorted(entries)])
+            if canonical != data:
+                raise ReleaseError(f"{name}.zip is not the canonical ZIP lambda-build writes for its files "
+                                   "(stored, sorted, fixed timestamps and permissions)")
+            archives.append((name, hashlib.sha256(data).hexdigest(), len(data)))
+            file_lists.append([path for path, _ in entries])
+            del data, entries, canonical
+        check_executables(config, file_lists)
+        sums, _, manifest_text = release_metadata(commit, config, archives)
+        for name, text in (("SHA256SUMS", sums), ("manifest.json", manifest_text)):
+            expected = text.encode()
+            mismatch = (f"{name} does not match what lambda-build writes for these ZIPs"
+                        + (f" and {commit}" if name == "manifest.json" else ""))
+            if read_member(directory, name, len(expected), mismatch) != expected:
+                raise ReleaseError(mismatch)
+    finally:
+        os.close(directory)
     return sums
 
 

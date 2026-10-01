@@ -1,5 +1,6 @@
 """Exercise the packaging contract, and the Git and container workflow when Docker is available."""
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
-from zipfile import ZIP_STORED, ZipFile, ZipInfo
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "lambda_build.py"
@@ -56,8 +57,9 @@ class PackagingTests(unittest.TestCase):
         return lambda_build.package(self.root, settings or config(), COMMIT, self.root / output)
 
     def assert_rejected(self, message, settings=None, output="release"):
+        """Expect packaging with these config overrides to fail, at config validation or later."""
         with self.assertRaisesRegex(lambda_build.ReleaseError, message):
-            self.package(settings, output)
+            self.package(config(**settings) if settings is not None else None, output)
         self.assertFalse((self.root / output).exists(), "a failed packaging must not leave release files")
 
     def test_matches_the_original_release_format_byte_for_byte(self):
@@ -103,12 +105,12 @@ class PackagingTests(unittest.TestCase):
     def test_marks_only_named_files_executable_and_requires_bootstrap_for_os_only_runtimes(self):
         self.files({"build/functions/web/bootstrap": b"\x7fELF web", "build/functions/worker/bootstrap": b"\x7fELF worker"})
         functions = {"assets": [], "assets_from": "build/functions", "runtime": "provided.al2023"}
-        self.assert_rejected("executable bootstrap", config(**functions))
+        self.assert_rejected("executable bootstrap", dict(**functions))
         manifest = self.package(config(**functions, executable=["bootstrap"]))
         self.assertEqual([a["asset"] for a in manifest["assets"]], ["web.zip", "worker.zip"])
         with ZipFile(self.root / "release/web.zip") as bundle:
             self.assertEqual(bundle.getinfo("bootstrap").external_attr >> 16, 0o100755)
-        self.assert_rejected("matches no packaged file", config(
+        self.assert_rejected("matches no packaged file", dict(
             assets=[{"name": "api", "directory": "build/functions/web"}], executable=["missing"]), output="other")
 
     def test_expected_files_must_match_exactly(self):
@@ -123,12 +125,12 @@ class PackagingTests(unittest.TestCase):
         (self.root / "build/api/link.mjs").symlink_to(self.root / "build/api/index.mjs")
         self.assert_rejected("symlink")
         (self.root / "build/api/link.mjs").unlink()
-        self.assert_rejected("Asset name", config(assets=[{"name": "-api", "directory": "build/api"}]))
-        self.assert_rejected("only once", config(assets=[{"name": "api", "directory": "build/api"}] * 2))
-        self.assert_rejected("inside the repository", config(assets=[{"name": "api", "directory": "../api"}]))
-        self.assert_rejected("expected a directory", config(assets=[{"name": "api", "directory": "missing"}]))
+        self.assert_rejected("Asset name", dict(assets=[{"name": "-api", "directory": "build/api"}]))
+        self.assert_rejected("only once", dict(assets=[{"name": "api", "directory": "build/api"}] * 2))
+        self.assert_rejected("inside the repository", dict(assets=[{"name": "api", "directory": "../api"}]))
+        self.assert_rejected("expected a directory", dict(assets=[{"name": "api", "directory": "missing"}]))
         (self.root / "empty").mkdir()
-        self.assert_rejected("no files", config(assets=[{"name": "api", "directory": "empty"}]))
+        self.assert_rejected("no files", dict(assets=[{"name": "api", "directory": "empty"}]))
         with self.assertRaisesRegex(lambda_build.ReleaseError, "full, lowercase Git commit SHA"):
             lambda_build.package(self.root, config(), "main", self.root / "release")
 
@@ -136,7 +138,7 @@ class PackagingTests(unittest.TestCase):
         # On a case-insensitive filesystem API.zip and api.zip are one file, so one ZIP would
         # silently replace the other while the manifest lists both.
         self.files({"build/upper/index.mjs": b"upper", "build/lower/index.mjs": b"lower"})
-        self.assert_rejected("differ only in case", config(assets=[{"name": "API", "directory": "build/upper"},
+        self.assert_rejected("differ only in case", dict(assets=[{"name": "API", "directory": "build/upper"},
                                                                    {"name": "api", "directory": "build/lower"}]))
         # A second safeguard: an existing ZIP is never overwritten.
         (self.root / "taken.zip").write_bytes(b"first")
@@ -150,8 +152,8 @@ class PackagingTests(unittest.TestCase):
         (outside / "secret.txt").write_text("host secret")
         (self.root / "build").mkdir()
         (self.root / "build/link").symlink_to(self.root / "outside")
-        self.assert_rejected("build/link is a symlink", config(assets=[{"name": "api", "directory": "build/link/api"}]))
-        self.assert_rejected("build/link is a symlink", config(assets=[], assets_from="build/link"))
+        self.assert_rejected("build/link is a symlink", dict(assets=[{"name": "api", "directory": "build/link/api"}]))
+        self.assert_rejected("build/link is a symlink", dict(assets=[], assets_from="build/link"))
 
     def test_refuses_to_mix_with_existing_release_files(self):
         self.files({"build/api/index.mjs": b"x", "release/old.zip": b"stale"})
@@ -344,6 +346,134 @@ class CheckTests(unittest.TestCase):
         with ZipFile(self.release / "api.zip", "w") as bundle:
             bundle.writestr(ZipInfo("bootstrap", (1980, 1, 1, 0, 0, 0)), b"#!/bin/sh\necho api\n")
         self.assert_blocked("api.zip is not the canonical ZIP")
+
+
+class HostileReleaseTests(unittest.TestCase):
+    """`check` must fail cleanly and cheaply on crafted releases whose checksums and manifest match their ZIPs."""
+
+    NODE = {"image": BUSYBOX, "build": "true", "runtime": "nodejs24.x", "architecture": "arm64"}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True)
+        self.release = self.root / "release"
+        self.release.mkdir()
+
+    def commit_config(self, settings):
+        (self.repo / "lambda-build.toml").write_text(toml(settings))
+        git = ["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.com"]
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "config"], check=True)
+        return subprocess.run([*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+
+    def write_release(self, commit, zips):
+        """Write the ZIPs with a SHA256SUMS and manifest.json that describe them exactly."""
+        entries = []
+        for name, data in sorted(zips.items()):
+            (self.release / f"{name}.zip").write_bytes(data)
+            entries.append({"name": name, "asset": f"{name}.zip", "sha256": hashlib.sha256(data).hexdigest(),
+                            "size": len(data), "runtime": "nodejs24.x", "architecture": "arm64"})
+        (self.release / "SHA256SUMS").write_text("".join(f"{e['sha256']}  {e['asset']}\n" for e in entries))
+        manifest = {"format_version": 3, "source_commit": commit, "assets": entries}
+        (self.release / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+    @staticmethod
+    def stored_zip(entries):
+        """Return stored ZIP bytes with canonical metadata for (path, bytes) entries, in the given order."""
+        buffer = io.BytesIO()
+        with ZipFile(buffer, "w", compression=ZIP_STORED) as bundle:
+            for path, data in entries:
+                info = ZipInfo(path, (1980, 1, 1, 0, 0, 0))
+                info.create_system = 3
+                info.external_attr = 0o100644 << 16
+                bundle.writestr(info, data)
+        return buffer.getvalue()
+
+    def cli(self, command, commit, release=None):
+        args = ["--release-dir", str(release or self.release), "--commit", commit] if command == "check" else \
+            ["--output", str(self.root / "out")]
+        return subprocess.run([sys.executable, str(SCRIPT), command, *args, "--repo", str(self.repo)],
+                              text=True, capture_output=True)
+
+    def assert_check_blocks(self, commit, message, release=None):
+        result = self.cli("check", commit, release)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(message, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_rejects_compressed_entries_before_expanding_them(self):
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        buffer = io.BytesIO()
+        with ZipFile(buffer, "w") as bundle:
+            info = ZipInfo("index.mjs", (1980, 1, 1, 0, 0, 0))
+            info.compress_type = ZIP_DEFLATED  # 8 MiB of zeros in a few KiB
+            bundle.writestr(info, b"\0" * (8 * 1024 * 1024))
+        self.write_release(commit, {"api": buffer.getvalue()})
+        self.assert_check_blocks(commit, "api.zip: entry index.mjs is not stored")
+
+    def test_rejects_too_many_entries_cleanly(self):
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        buffer = io.BytesIO()
+        with ZipFile(buffer, "w", compression=ZIP_STORED) as bundle:
+            for index in range(65536):
+                bundle.writestr(ZipInfo(f"f{index:05d}", (1980, 1, 1, 0, 0, 0)), b"")
+        self.write_release(commit, {"api": buffer.getvalue()})
+        self.assert_check_blocks(commit, "more than 65535 files")
+
+    def test_rejects_oversized_files_before_reading_them(self):
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        self.write_release(commit, {"api": self.stored_zip([("index.mjs", b"x")])})
+        with open(self.release / "api.zip", "r+b") as archive:
+            archive.truncate(50 * 1024 * 1024 + 1)  # sparse, so the test stays cheap
+        self.assert_check_blocks(commit, "api.zip exceeds Lambda's 50 MiB direct-upload limit")
+        self.write_release(commit, {"api": self.stored_zip([("index.mjs", b"x")])})
+        with open(self.release / "manifest.json", "r+b") as manifest:
+            manifest.truncate(64 * 1024 * 1024)
+        self.assert_check_blocks(commit, "manifest.json does not match")
+
+    def test_rejects_duplicate_noncanonical_and_conflicting_paths(self):
+        commit = self.commit_config({**self.NODE, "assets": [{"name": "api", "directory": "build/api"}]})
+        cases = {"duplicate": ([("index.mjs", b"one"), ("index.mjs", b"two")], "duplicate path index.mjs"),
+                 "dot segment": ([("./index.mjs", b"x")], "noncanonical path ./index.mjs"),
+                 "file and directory": ([("a", b"x"), ("a/b", b"y")], "a is both a file and a directory")}
+        for label, (entries, message) in cases.items():
+            with self.subTest(label):
+                for path in self.release.iterdir():
+                    path.unlink()
+                self.write_release(commit, {"api": self.stored_zip(entries)})
+                self.assert_check_blocks(commit, message)
+
+    def test_rejects_empty_releases_and_empty_zips(self):
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        self.write_release(commit, {})
+        self.assert_check_blocks(commit, "no assets")
+        self.write_release(commit, {"api": self.stored_zip([])})
+        self.assert_check_blocks(commit, "api: no files to package")
+
+    def test_rejects_invalid_configs_through_both_commands(self):
+        invalid = {"duplicate asset names": ({"assets": [{"name": "api", "directory": "build/a"},
+                                                         {"name": "api", "directory": "build/b"}]}, "only once"),
+                   "a directory outside the repository": ({"assets": [{"name": "api", "directory": "../outside"}]},
+                                                          "must be a path inside the repository")}
+        for label, (settings, message) in invalid.items():
+            commit = self.commit_config({**self.NODE, **settings})
+            for command in ("check", "package"):
+                with self.subTest(label, command=command):
+                    result = self.cli(command, commit)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn(message, result.stderr)
+
+    def test_rejects_a_symlinked_release_directory(self):
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        self.write_release(commit, {"api": self.stored_zip([("index.mjs", b"x")])})
+        self.assertEqual(self.cli("check", commit).returncode, 0, "the real directory itself passes")
+        link = self.root / "link"
+        link.symlink_to(self.release)
+        self.assert_check_blocks(commit, "is a symlink", release=link)
 
 
 class CaseCollisionTests(unittest.TestCase):
