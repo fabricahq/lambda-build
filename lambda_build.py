@@ -336,13 +336,16 @@ def package_commit(repo, revision, config_path, output):
 
 
 def download_release(repository, tag, destination):
-    """Download a GitHub release's SHA256SUMS and manifest.json with the gh CLI's credentials."""
-    subprocess.run(["gh", "release", "download", tag, "--repo", repository, "--pattern", "SHA256SUMS",
-                    "--pattern", "manifest.json", "--dir", str(destination)], check=True)
+    """Download every file of a GitHub release with the gh CLI's credentials."""
+    subprocess.run(["gh", "release", "download", tag, "--repo", repository, "--dir", str(destination)], check=True)
 
 
 def verify(repo, release, config_path):
-    """Rebuild the release in `release` from its source commit and return the files that differ."""
+    """Rebuild the release in `release` from its source commit and return the files that differ.
+
+    Every file counts: each ZIP, SHA256SUMS, and manifest.json must match the rebuild byte for
+    byte, and a file missing from either side, or present in only one, is a difference.
+    """
     try:
         manifest = json.loads((release / "manifest.json").read_text())
         commit = manifest["source_commit"]
@@ -358,8 +361,7 @@ def verify(repo, release, config_path):
     with tempfile.TemporaryDirectory(prefix="lambda-build-verify-") as temporary:
         rebuilt = Path(temporary) / "rebuilt"
         build(repo, commit, config, rebuilt)
-        return [name for name in ("SHA256SUMS", "manifest.json")
-                if not (release / name).is_file() or (release / name).read_bytes() != (rebuilt / name).read_bytes()]
+        return differences(release, rebuilt)
 
 
 def main(argv=None):
@@ -371,7 +373,7 @@ def main(argv=None):
     verify_parser = commands.add_parser("verify", help="rebuild a published release and compare its files")
     source = verify_parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--tag", help="GitHub release tag to download with gh; needs --repository")
-    source.add_argument("--release-dir", type=Path, help="directory already holding the release's SHA256SUMS and manifest.json")
+    source.add_argument("--release-dir", type=Path, help="directory holding exactly the release's ZIPs, SHA256SUMS, and manifest.json")
     verify_parser.add_argument("--repository", help="OWNER/NAME of the GitHub repository that published --tag")
     for command in (package_parser, verify_parser):
         command.add_argument("--repo", type=Path, default=Path("."), help="Git repository holding the source (default: .)")

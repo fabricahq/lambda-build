@@ -322,11 +322,31 @@ class ContainerTests(unittest.TestCase):
         self.assertEqual(verified.returncode, 0, verified.stderr)
         self.assertIn("Rebuilt release matches.", verified.stderr)
 
-        # A release that the source cannot reproduce fails verification.
-        (self.root / "release/SHA256SUMS").write_text(f"{'0' * 64}  api.zip\n")
-        tampered = self.cli("verify", "--release-dir", str(self.root / "release"))
-        self.assertEqual(tampered.returncode, 1)
-        self.assertIn("differs from the release in SHA256SUMS", tampered.stderr)
+        # A release that the source cannot reproduce fails verification, whether the metadata
+        # or a published ZIP changed, or a file is missing or extra.
+        release = self.root / "release"
+        pristine = {p.name: p.read_bytes() for p in release.iterdir()}
+
+        def assert_differs(change, name):
+            for path in release.iterdir():
+                path.unlink()
+            for file, data in pristine.items():
+                (release / file).write_bytes(data)
+            change()
+            result = self.cli("verify", "--release-dir", str(release))
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn(f"differs from the release in {name}", result.stderr)
+
+        assert_differs(lambda: (release / "SHA256SUMS").write_text(f"{'0' * 64}  api.zip\n"), "SHA256SUMS")
+        assert_differs(lambda: (release / "api.zip").write_bytes(pristine["api.zip"] + b"x"), "api.zip")
+        assert_differs(lambda: (release / "api.zip").unlink(), "api.zip")
+        assert_differs(lambda: (release / "extra.zip").write_bytes(b"extra"), "extra.zip")
+
+    def test_verify_downloads_every_release_file(self):
+        with mock.patch.object(lambda_build.subprocess, "run") as run:
+            lambda_build.download_release("fabricahq/example", "v1.2.3", self.root)
+        self.assertEqual(run.call_args.args[0], ["gh", "release", "download", "v1.2.3", "--repo", "fabricahq/example",
+                                                 "--dir", str(self.root)])
 
     def test_rejects_irreproducible_and_failing_builds(self):
         self.commit("mkdir -p build/api && echo $RANDOM$RANDOM > build/api/index.mjs")

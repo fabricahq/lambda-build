@@ -10,7 +10,7 @@ This repository is built for Fabrica's own repositories and conventions. It is p
 - **Packages byte-reproducible ZIPs.** Entries are stored uncompressed, sorted by path, dated 1980-01-01, with 0644 permissions, or 0755 for files you mark executable. Packaging fails unless both builds produce identical ZIPs.
 - **Enforces Lambda's direct-upload limits**: 50 MiB per ZIP and 250 MiB unzipped. It also requires an executable `bootstrap` for OS-only runtimes such as `provided.al2023`.
 - **Builds with read-only access.** The reusable build workflow owns its job with `contents: read` and refuses `pull_request_target`.
-- **Verifies a published release.** `verify` rebuilds a release from its source commit and compares the result with its `SHA256SUMS` and `manifest.json`.
+- **Verifies a published release.** `verify` rebuilds a release from its source commit and compares every published file, the ZIPs included, with the rebuild.
 
 lambda-build never tags or publishes. [Release Planner](https://github.com/fabricahq/release-planner) does: it calls your build on the release pull request, attests the files, and publishes them when you merge.
 
@@ -111,7 +111,7 @@ python3 lambda_build.py package --output build/release-assets
 python3 lambda_build.py verify --repository OWNER/NAME --tag v1.2.3
 ```
 
-`verify` downloads the release's `SHA256SUMS` and `manifest.json` with `gh`, so the source commit must be in your clone. It reads `lambda-build.toml` as committed at that commit. Use the `lambda_build.py` from the commit of this repository that the release's workflow pinned. `--help` lists every option.
+`verify` downloads every file of the release with `gh` and requires each ZIP, `SHA256SUMS`, and `manifest.json` to match the rebuild byte for byte, with no file missing or extra. The source commit must be in your clone. It reads `lambda-build.toml` as committed at that commit. Use the `lambda_build.py` from the commit of this repository that the release's workflow pinned. `--help` lists every option.
 
 ## Develop
 
