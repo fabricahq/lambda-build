@@ -16,3 +16,21 @@ Keep these invariants:
 - Pin every action and container image to a full digest or commit SHA, with a version comment for actions.
 
 Run `python3 -B -m unittest discover -s test -v` with Docker running before you push. When a command, config setting, workflow input, or release file changes, update the README in the same pull request.
+
+<!-- release-planner:begin v0.4.3 sha256:3d7c63eae9a8c94d -->
+## Releases
+
+This repository publishes releases with [Release Planner](https://github.com/fabricahq/release-planner) v0.4.3. When asked to make a release, draft, revise, or correct release notes, or retry a failed release, print the release procedure and follow it:
+
+```sh
+release-planner guide
+```
+
+First check that `release-planner version` prints `v0.4.3`. If it doesn't, or `release-planner` isn't installed, install that version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fabricahq/release-planner/v0.4.3/install.sh | sh -s -- --version v0.4.3
+```
+
+Read `.release-planner/policy.md` first for this repository's release policy. You prepare the release pull request; the maintainer approves the release by merging it. Never tag, publish, or merge.
+<!-- release-planner:end -->
