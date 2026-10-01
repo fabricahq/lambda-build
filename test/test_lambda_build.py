@@ -97,6 +97,21 @@ class PackagingTests(unittest.TestCase):
         self.package(output="again")
         self.assertEqual((self.root / "again/api.zip").read_bytes(), archive)
 
+    def test_package_memory_does_not_grow_with_the_number_of_assets(self):
+        # package once held every ZIP in memory until it staged them all.
+        def peak(count, output):
+            for index in range(count):
+                self.files({f"build/functions/f{index}/index.mjs": bytes([index]) * (2 * 1024 * 1024)})
+            tracemalloc.start()
+            try:
+                lambda_build.package(self.root, config(assets=[], assets_from="build/functions"), COMMIT, self.root / output)
+                return tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+        one = peak(1, "one")
+        eight = peak(8, "eight")
+        self.assertLess(eight, one + 3 * 1024 * 1024, f"one asset peaked at {one} bytes, eight at {eight}")
+
     def test_changed_files_change_the_digest(self):
         self.files({"build/api/index.mjs": b"one"})
         self.package()
@@ -504,6 +519,27 @@ class HostileReleaseTests(unittest.TestCase):
             tracemalloc.stop()
         self.assertLess(peak, 1024 * 1024)
 
+    def test_accepts_a_file_name_that_looks_like_a_zip64_locator(self):
+        # The last 20 bytes before the end record are this name, which once read as a Zip64 locator.
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        self.write_release(commit, {"api": self.stored_zip([("PK\x06\x07" + "a" * 16, b"x")])})
+        result = self.cli("check", commit)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_verify_refuses_an_oversized_manifest_before_reading_it(self):
+        commit = self.commit_config({**self.NODE, "assets_from": "build"})
+        self.write_release(commit, {"api": self.stored_zip([("index.mjs", b"x")])})
+        with open(self.release / "manifest.json", "r+b") as manifest:
+            manifest.truncate(64 * 1024 * 1024)
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(lambda_build.ReleaseError, "manifest.json is larger than"):
+                lambda_build.verify(self.repo, self.release, "lambda-build.toml")
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 2 * 1024 * 1024)
+
     def test_refuses_archives_that_are_not_one_plain_central_directory(self):
         commit = self.commit_config({**self.NODE, "assets_from": "build"})
         valid = self.stored_zip([("index.mjs", b"x")])
@@ -542,6 +578,9 @@ class HostileReleaseTests(unittest.TestCase):
                                             "contains a NUL"),
                    "a 256-byte name in assets_from": ({"assets_from": "build/" + "a" * 256},
                                                       "a name longer than 255 bytes"),
+                   "an asset name whose ZIP name exceeds 255 bytes": ({"assets": [{"name": "a" * 252,
+                                                                                    "directory": "build/a"}]},
+                                                                      "longer than 255 bytes"),
                    "a directory longer than 1024 bytes": ({"assets": [{"name": "api",
                                                                        "directory": "/".join(["a" * 200] * 6)}]},
                                                           "longer than 1024 bytes")}
@@ -654,6 +693,11 @@ class PathLimitTests(unittest.TestCase):
         lambda_build.check_end_record("api", lambda_build.zip_bytes([(path, b"", False) for path in files]))
         self.assert_paths(files + ["g"], "more than 65534 files")
 
+    def test_limits_asset_names_so_the_zip_name_fits_in_255_bytes(self):
+        lambda_build.check_name("a" * 251)  # a...a.zip is 255 bytes
+        with self.assertRaisesRegex(lambda_build.ReleaseError, "longer than 255 bytes"):
+            lambda_build.check_name("a" * 252)
+
     def test_rejects_nul_in_paths(self):
         self.assert_paths(["a\0b"], "contains a NUL")
 
@@ -764,6 +808,21 @@ class ContainerTests(unittest.TestCase):
             lambda_build.download_release("fabricahq/example", "v1.2.3", self.root)
         self.assertEqual(run.call_args.args[0], ["gh", "release", "download", "v1.2.3", "--repo", "fabricahq/example",
                                                  "--dir", str(self.root)])
+
+    def test_verify_compares_an_oversized_zip_without_reading_it(self):
+        self.commit("mkdir -p build/api && cp src/index.mjs build/api/")
+        release = self.root / "release"
+        self.assertEqual(self.cli("package", "--output", str(release)).returncode, 0)
+        with open(release / "api.zip", "r+b") as archive:
+            archive.truncate(60 * 1024 * 1024)  # sparse
+        tracemalloc.start()
+        try:
+            changed = lambda_build.verify(self.repo, release, "lambda-build.toml")
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(changed, ["api.zip"])
+        self.assertLess(peak, 16 * 1024 * 1024)
 
     def test_rejects_irreproducible_and_failing_builds(self):
         self.commit("mkdir -p build/api && echo $RANDOM$RANDOM > build/api/index.mjs")

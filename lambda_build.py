@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import zlib
 from zipfile import ZIP_STORED, ZipFile, ZipInfo
 
 # Format 3 records runtime and architecture on each asset; format 2 recorded them once per release.
@@ -35,8 +36,13 @@ MAX_UNPACKED_BYTES = 250 * 1024 * 1024
 MAX_FILES = 65534
 # A documented cap on ZIPs per release, so check's work and memory stay bounded with assets_from.
 MAX_ASSETS = 100
-# The end-of-central-directory record that ends every ZIP lambda-build writes, with no comment.
+# Far above any real manifest: 100 assets take about 30 KB.
+MAX_MANIFEST_BYTES = 1024 * 1024
+# The end-of-central-directory record that ends every ZIP lambda-build writes, with no comment,
+# and the central directory and local file headers it points to.
 END_RECORD = struct.Struct("<4s4H2LH")
+CENTRAL_RECORD = struct.Struct("<4s6H3L5HLL")
+LOCAL_HEADER = struct.Struct("<4s5H3L2H")
 # Paths a Linux filesystem accepts: 255-byte names (NAME_MAX), and a cap on the whole path that
 # also bounds its depth.
 MAX_NAME_BYTES = 255
@@ -168,9 +174,12 @@ def collect(directory):
 
 
 def check_name(name):
-    """Fail unless `name` is a valid asset name, which also makes NAME.zip a plain file name."""
+    """Fail unless `name` is a valid asset name, which also makes NAME.zip a plain file name that
+    fits a filesystem's 255-byte limit."""
     if not NAME.fullmatch(name):
         raise ReleaseError(f"Asset name {name!r} must start with a letter or digit and use only letters, digits, '.', '_', and '-'")
+    if len(f"{name}.zip".encode()) > MAX_NAME_BYTES:
+        raise ReleaseError(f"Asset name {name[:40]}... makes a ZIP name longer than {MAX_NAME_BYTES} bytes")
 
 
 def check_names(names, allow_empty=False):
@@ -319,19 +328,19 @@ def package(root, config, commit, output):
         check_asset(name, files, sum((directory / f).stat().st_size for f in files), expected, config)
         contents[name] = (directory, files)
     check_executables(config, {path for _, files in contents.values() for path in files if path in executables})
-    archives = [(name, zip_bytes([(f, (directory / f).read_bytes(), f in executables) for f in files]))
-                for name, (directory, files) in contents.items()]
-    sums, manifest, manifest_text = release_metadata(
-        commit, config, [(name, hashlib.sha256(data).hexdigest(), len(data)) for name, data in archives])
 
     output.parent.mkdir(parents=True, exist_ok=True)
     # Stage beside the output and move it into place last, so a failure never leaves partial assets.
     with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as temporary:
         staging = Path(temporary) / "release"
         staging.mkdir()
-        for name, data in archives:
-            with open(staging / f"{name}.zip", "xb") as archive:
-                archive.write(data)
+        archives = []
+        # One ZIP at a time, reading one file at a time, so memory does not grow with the release.
+        for name, (directory, files) in contents.items():
+            archive = staging / f"{name}.zip"
+            write_zip(((f, (directory / f).read_bytes(), f in executables) for f in files), archive)
+            archives.append((name, file_digest(archive), archive.stat().st_size))
+        sums, manifest, manifest_text = release_metadata(commit, config, archives)
         (staging / "SHA256SUMS").write_text(sums)
         (staging / "manifest.json").write_text(manifest_text)
         if output.exists():
@@ -357,9 +366,10 @@ def read_member(directory, name, limit, too_large):
 
 
 def check_end_record(name, data):
-    """Fail unless `data` ends with the plain end record lambda-build writes, before zipfile parses
-    the central directory: no comment or trailing bytes, no Zip64, one disk, at most MAX_FILES
+    """Fail unless `data` ends with the plain end record lambda-build writes, before the central
+    directory is parsed: no comment or trailing bytes, no Zip64, one disk, at most MAX_FILES
     entries, and a central directory directly before the record and no larger than its entries need.
+    Returns the entry count and the central directory's offset.
     """
     if len(data) < END_RECORD.size:
         raise ReleaseError(f"{name}.zip is too short to be a ZIP")
@@ -367,36 +377,63 @@ def check_end_record(name, data):
     signature, disk, directory_disk, disk_entries, entries, size, offset, comment = END_RECORD.unpack_from(data, end)
     if signature != b"PK\x05\x06" or comment:
         raise ReleaseError(f"{name}.zip does not end with a plain end record (lambda-build writes no comment or trailing bytes)")
-    if 0xFFFF in (disk_entries, entries) or 0xFFFFFFFF in (size, offset) or data[max(0, end - 20):end][:4] == b"PK\x06\x07":
+    # Zip64 saturates these fields; any Zip64 record or locator would also sit between the central
+    # directory and this record, which the offset check below refuses.
+    if 0xFFFF in (disk_entries, entries) or 0xFFFFFFFF in (size, offset):
         raise ReleaseError(f"{name}.zip uses Zip64, which lambda-build never writes")
     if disk or directory_disk or disk_entries != entries:
         raise ReleaseError(f"{name}.zip spans several disks")
     if entries > MAX_FILES:
         raise ReleaseError(f"{name}: more than {MAX_FILES} files, the most a ZIP without Zip64 holds")
     # A central directory record is 46 bytes plus its file name, and lambda-build adds no extras.
-    if offset + size != end or size > entries * (46 + MAX_PATH_BYTES):
+    if offset + size != end or size > entries * (CENTRAL_RECORD.size + MAX_PATH_BYTES):
         raise ReleaseError(f"{name}.zip has a central directory that does not match its end record")
+    return entries, offset
 
 
 def read_zip_entries(name, data, expected, config):
     """Return the (path, bytes) entries of an untrusted ZIP after the checks that need no file contents.
 
-    Rejects anything but stored entries and applies the shared asset rules before reading entry
-    data, so no entry is decompressed and memory stays within the archive's own size.
+    Parses the central directory directly rather than with zipfile, which searches for Zip64 records
+    and can misread a file name as one. Rejects anything but stored entries and applies the shared
+    asset rules before reading entry data, so nothing is decompressed and memory stays within the
+    archive's own size. The caller still requires the canonical bytes, which covers every field
+    this does not check.
     """
-    check_end_record(name, data)
+    count, position = check_end_record(name, data)
+    directory_end = len(data) - END_RECORD.size
+    records = []
     try:
-        with ZipFile(BytesIO(data)) as bundle:
-            infos = bundle.infolist()
-            check_paths(name, [info.filename for info in infos[:MAX_FILES + 1]])
-            for info in infos:
-                if info.compress_type != ZIP_STORED or info.compress_size != info.file_size:
-                    raise ReleaseError(f"{name}.zip: entry {info.filename} is not stored")
-            check_asset(name, [info.filename for info in infos], sum(info.file_size for info in infos), expected, config)
-            return [(info.filename, bundle.read(info)) for info in infos]
-    except ReleaseError:
-        raise
-    except Exception as error:  # zipfile raises many types for malformed input; all mean "not a release ZIP"
+        for _ in range(count):
+            if position + CENTRAL_RECORD.size > directory_end:
+                raise ReleaseError(f"{name}.zip has a truncated central directory")
+            (signature, _, _, flags, method, _, _, crc, compressed, size, name_length, extra_length,
+             comment_length, _, _, _, local) = CENTRAL_RECORD.unpack_from(data, position)
+            if signature != b"PK\x01\x02":
+                raise ReleaseError(f"{name}.zip has a malformed central directory")
+            raw = data[position + CENTRAL_RECORD.size:position + CENTRAL_RECORD.size + name_length]
+            path = raw.decode("utf-8" if flags & 0x800 else "cp437")
+            if method != ZIP_STORED or compressed != size:
+                raise ReleaseError(f"{name}.zip: entry {path} is not stored")
+            records.append((path, local, size, crc))
+            position += CENTRAL_RECORD.size + name_length + extra_length + comment_length
+        if position != directory_end:
+            raise ReleaseError(f"{name}.zip has a central directory that does not match its end record")
+        check_asset(name, [path for path, _, _, _ in records], sum(size for _, _, size, _ in records), expected, config)
+        entries = []
+        for path, local, size, crc in records:
+            if local + LOCAL_HEADER.size > len(data):
+                raise ReleaseError(f"{name}.zip: entry {path} has no local header")
+            signature, *_, name_length, extra_length = LOCAL_HEADER.unpack_from(data, local)
+            start = local + LOCAL_HEADER.size + name_length + extra_length
+            if signature != b"PK\x03\x04" or start + size > len(data):
+                raise ReleaseError(f"{name}.zip: entry {path} has a malformed local header")
+            content = data[start:start + size]
+            if zlib.crc32(content) != crc:
+                raise ReleaseError(f"{name}.zip: entry {path} fails its CRC check")
+            entries.append((path, content))
+        return entries
+    except (struct.error, UnicodeDecodeError) as error:
         raise ReleaseError(f"{name}.zip is not a readable ZIP ({type(error).__name__}: {error})") from None
 
 
@@ -561,12 +598,32 @@ def build(repo, commit, config, output):
         return package(root, config, commit, output)
 
 
+def file_digest(path):
+    """Return a file's SHA-256, reading it in chunks."""
+    with open(path, "rb") as file:
+        return hashlib.file_digest(file, "sha256").hexdigest()
+
+
+def same_file(first, second):
+    """Compare two regular files by size, then in chunks, so neither is read whole."""
+    if first.is_symlink() or second.is_symlink() or not first.is_file() or not second.is_file():
+        return False
+    if first.stat().st_size != second.stat().st_size:
+        return False
+    with open(first, "rb") as one, open(second, "rb") as other:
+        while True:
+            chunk = one.read(1024 * 1024)
+            if chunk != other.read(1024 * 1024):
+                return False
+            if not chunk:
+                return True
+
+
 def differences(first, second):
-    """List the release files that are missing from one directory or differ in bytes."""
+    """List the release files that are missing from one directory or differ in bytes, comparing
+    sizes first and contents in chunks, so an oversized file is never read whole."""
     names = sorted({p.name for p in first.iterdir()} | {p.name for p in second.iterdir()})
-    return [name for name in names
-            if not ((first / name).is_file() and (second / name).is_file()
-                    and (first / name).read_bytes() == (second / name).read_bytes())]
+    return [name for name in names if not same_file(first / name, second / name)]
 
 
 def package_commit(repo, revision, config_path, output):
@@ -602,8 +659,15 @@ def verify(repo, release, config_path):
     Every file counts: each ZIP, SHA256SUMS, and manifest.json must match the rebuild byte for
     byte, and a file missing from either side, or present in only one, is a difference.
     """
+    path = release / "manifest.json"
     try:
-        manifest = json.loads((release / "manifest.json").read_text())
+        if path.is_symlink() or not path.is_file():
+            raise ReleaseError(f"{release}: manifest.json is not a regular file")
+        if path.stat().st_size > MAX_MANIFEST_BYTES:
+            raise ReleaseError(f"{release}: manifest.json is larger than {MAX_MANIFEST_BYTES} bytes, "
+                               "more than any lambda-build manifest")
+        with open(path, "rb") as file:
+            manifest = json.loads(file.read(MAX_MANIFEST_BYTES + 1)[:MAX_MANIFEST_BYTES])
         commit = manifest["source_commit"]
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise ReleaseError(f"{release}: unreadable manifest.json ({error})") from None
