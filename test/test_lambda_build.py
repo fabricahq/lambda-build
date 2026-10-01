@@ -187,7 +187,7 @@ class PackagingTests(unittest.TestCase):
 
 
 class StagingTests(unittest.TestCase):
-    def test_a_failed_second_build_leaves_no_release_files(self):
+    def test_a_failed_second_build_leaves_no_release_files_or_builds(self):
         with tempfile.TemporaryDirectory() as temporary:
             repo, output = Path(temporary) / "repo", Path(temporary) / "release"
             repo.mkdir()
@@ -201,19 +201,24 @@ class StagingTests(unittest.TestCase):
 
             calls = []
 
-            def build(repo, commit, config, destination):
-                calls.append(destination)
+            def build_tree(repo, commit, config, root):
+                calls.append(root)
                 if len(calls) == 2:
                     raise lambda_build.ReleaseError("second build failed")
-                destination.mkdir()
-                (destination / "api.zip").write_text("first")
+                (root / "build/api").mkdir(parents=True)
+                (root / "build/api/index.mjs").write_text("first")
 
-            with mock.patch.object(lambda_build, "build", build):
+            with mock.patch.object(lambda_build, "build_tree", build_tree):
                 with self.assertRaisesRegex(lambda_build.ReleaseError, "second build failed"):
                     lambda_build.package_commit(repo, "HEAD", "lambda-build.toml", output)
+                builds = Path(temporary) / "builds"
+                calls.clear()
+                with self.assertRaisesRegex(lambda_build.ReleaseError, "second build failed"):
+                    lambda_build.build_twice(repo, "HEAD", "lambda-build.toml", builds)
             self.assertEqual(len(calls), 2)
             self.assertFalse(output.exists())
-            self.assertEqual(list(output.parent.glob(".release-*")), [])
+            self.assertFalse(builds.exists(), "a failed build must not leave a builds directory")
+            self.assertEqual(list(output.parent.glob(".release-*")) + list(output.parent.glob(".builds-*")), [])
 
 
 class ExportTests(unittest.TestCase):
@@ -834,6 +839,43 @@ class ContainerTests(unittest.TestCase):
             tracemalloc.stop()
         self.assertEqual(changed, ["api.zip"])
         self.assertLess(peak, 16 * 1024 * 1024)
+
+    def test_builds_and_packages_as_separate_steps(self):
+        commit = self.commit("mkdir -p build/api && cp src/index.mjs build/api/")
+        builds = self.root / "builds"
+        built = self.cli("build", "--output", str(builds))
+        self.assertEqual(built.returncode, 0, built.stderr)
+        self.assertEqual(built.stderr.count("$ mkdir -p build/api"), 2)
+        self.assertEqual(sorted(p.name for p in builds.iterdir()), ["build.json", "first", "second"])
+        self.assertTrue((builds / "first/build/api/index.mjs").is_file())
+        self.assertEqual(json.loads((builds / "build.json").read_text()),
+                         {"source_commit": commit, "config": "lambda-build.toml"})
+
+        packaged = self.cli("package", "--builds", str(builds), "--output", str(self.root / "split"))
+        self.assertEqual(packaged.returncode, 0, packaged.stderr)
+        self.assertEqual(packaged.stdout, f"{FIXTURE_SHA256}  api.zip\n")
+        self.assertNotIn("$ mkdir", packaged.stderr, "packaging two builds must not build again")
+        whole = self.cli("package", "--output", str(self.root / "whole"))
+        self.assertEqual(whole.returncode, 0, whole.stderr)
+        self.assertEqual(lambda_build.differences(self.root / "split", self.root / "whole"), [])
+
+        # Packaging still requires the two builds to produce identical files.
+        (builds / "second/build/api/index.mjs").write_text("changed")
+        differ = self.cli("package", "--builds", str(builds), "--output", str(self.root / "differ"))
+        self.assertEqual(differ.returncode, 1)
+        self.assertIn("produced different", differ.stderr)
+        self.assertFalse((self.root / "differ").exists())
+
+    def test_package_reads_the_commit_and_config_from_the_builds(self):
+        self.commit("true")
+        builds = self.root / "builds"
+        builds.mkdir()
+        both = self.cli("package", "--builds", str(builds), "--commit", "HEAD", "--output", str(self.root / "out"))
+        self.assertEqual(both.returncode, 2)
+        self.assertIn("--builds records its commit and config", both.stderr)
+        missing = self.cli("package", "--builds", str(builds), "--output", str(self.root / "out"))
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("build.json", missing.stderr)
 
     def test_rejects_irreproducible_and_failing_builds(self):
         self.commit("mkdir -p build/api && echo $RANDOM$RANDOM > build/api/index.mjs")
