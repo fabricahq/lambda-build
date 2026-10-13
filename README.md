@@ -81,6 +81,8 @@ jobs:
       # runs-on: ubuntu-24.04-arm   # the default; match the Lambda architecture
 ```
 
+The job installs its own Python, so a runner needs only Git and Docker. That includes self-hosted runners: pass their label as `runs-on`, such as `self-hosted` for an Apple silicon Mac building `arm64` functions.
+
 The build workflow checks out `ref` and runs each stage as its own step: build the functions twice in the pinned container, package each build into reproducible ZIPs and require them to match, check the release files, and upload the ZIPs, `SHA256SUMS`, and `manifest.json` as the `release-assets` artifact, with the files at its top level. It checks out `lambda_build.py` from its own commit, so the SHA you pin decides both. Release Planner's release workflow calls `build-release.yml` with read-only access, and this workflow keeps it that way.
 
 Release Planner attests every release asset, and GitHub offers artifact attestations only to public repositories, or to private ones on GitHub Enterprise Cloud.
